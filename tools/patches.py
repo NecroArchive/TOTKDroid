@@ -183,6 +183,20 @@ PATCHES_143[0x700095dd24] = _fade_step(8)
 PATCHES_143[0x70006155e4] = _fade_step(10)
 PATCHES_143[0x7000615660] = _fade_step(10)
 
+# Equipment-switch cooldown (site from totk-pc-recomp recomp/patches-v143.txt, MIT; their issue #18, found by JieML1100;
+# seen in UltraTears): the player update (main+0x2b0368) steps the countdown at player state +0x109c only while it is
+# above FLT_EPSILON, but the equipment gate (main+0x31cc7c) blocks weapon, shield and bow changes while it is above 0.
+# Whole 30 Hz steps reach exactly 0; a measured step can leave a remainder in (0, FLT_EPSILON] that is never stepped
+# again, and equipment stayed locked until a load. On real time (rt_realtime) the threshold is 0: the remainder goes
+# below 0 like any last step. LARECOMP_REALTIME=0: the original's FLT_EPSILON.
+def _cooldown(gen, a):
+    _expect(gen, a, 0x0f016681)  # movi v1.2s, #0x34, lsl #24 (FLT_EPSILON in both lanes)
+    return ('{ extern _Bool rt_realtime(void); c->v[1] = rt_realtime() ? 0 : (__uint128_t)0x3400000034000000ull; }'
+            f'  /* {a:#x}: movi v1.2s, #0x34, lsl #24, or #0 on real time (the cooldown\'s threshold) */')
+
+
+PATCHES_143[0x70002b036c] = _cooldown
+
 PATCHES_143[0x7000246eac] = _cloth_inline(0x360, 0x364, 10, 0, 0, 0x1e200940, 'fmul s0, s10, s0')
 PATCHES_143[0x7000345904] = _cloth_inline(0x110, 0x114, 0, 1, 1, 0x1e210801, 'fmul s1, s0, s1')
 PATCHES_143[0x7000249448] = _cloth_call_args(0x2a1403e6, 20, 'mov w6, w20')

@@ -1739,6 +1739,7 @@ static int realtime_on(void) {
     if (on < 0) on = !getenv("LARECOMP_REALTIME") || atoi(getenv("LARECOMP_REALTIME"));
     return on;
 }
+bool rt_realtime(void) { return realtime_on(); }  // (tools/patches.py: the equipment-switch cooldown)
 static void frame_step_update(uint64_t now_ns) {
     static uint64_t last;
     static double samples[5];

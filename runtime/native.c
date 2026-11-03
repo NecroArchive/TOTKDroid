@@ -259,6 +259,10 @@ static int fix_aspect_load(Cpu *c, int rn, uint32_t off) {  // ldr s0, [x<rn>, #
 static int fix_aspect_cam(Cpu *c) { return fix_aspect_load(c, 19, 0x140); }
 static int fix_aspect_setup(Cpu *c) { return fix_aspect_load(c, 22, 0x68); }
 static int fix_aspect_view(Cpu *c) { vset(c, 0, rt_widen_aspect(vget(c, 0) / vget(c, 1))); return 3; }  // fdiv s0, s0, s1
+// Equipment-switch cooldown: the threshold the player update steps its countdown down to, FLT_EPSILON in the game, 0 on
+// real time - a measured step's remainder in (0, FLT_EPSILON] kept weapon, shield and bow changes locked until a load.
+bool rt_realtime(void);  // nvn/objects.c
+static int fix_cooldown(Cpu *c) { if (!rt_realtime()) return 0; c->v[1] = 0; return 3; }  // movi v1.2s, #0x34, lsl #24
 static int fix_fade_w8(Cpu *c) { return fade_step(c, 8); }
 static int fix_fade_w10(Cpu *c) { return fade_step(c, 10); }
 typedef struct { int version; uint64_t addr, alt; uint32_t word; int (*fn)(Cpu *); const char *what; } Fix;
@@ -295,6 +299,7 @@ static const Fix fixes[] = {  // (canonical addresses, 0x7000000000 + the offset
     {143, 0x7000b43460, 0, 0xbd406ac0, fix_aspect_setup, "camera aspect (setup)"},
     {143, 0x7001ff04f4, 0, 0x1e211800, fix_aspect_view, "camera aspect (viewport)"},
     {143, 0x700253fbb0, 0, 0x1e211800, fix_aspect_view, "camera aspect (viewport)"},
+    {143, 0x70002b036c, 0, 0x0f016681, fix_cooldown, "equipment-switch cooldown"},
 };
 int native_patch_c(Cpu *c, uint32_t i) { return fixes[i].fn(c); }
 
