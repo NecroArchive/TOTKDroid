@@ -76,6 +76,7 @@ public class TOTKRecompAndroidActivity extends SDLActivity {
     private native String nativeBuildRomfs(String[] paths, long[] sizes);
     private static native boolean nativeCheckRomfs(int version, String[] paths, String versionTxt);
     private static native boolean nativeCheckRomfsImage(int version, int fd);  // (fd: closed by the native side)
+    private static native boolean nativeCheckRomfsDir(int version, String dir);  // (a romfs/ used in place, by its path)
     private static native String nativeImageLoose(int fd);
     private static native void nativeDriverPicked(String name);
     private static native void nativeModImportDone(String message);
@@ -911,6 +912,10 @@ public class TOTKRecompAndroidActivity extends SDLActivity {
                 importImage(tree, version);
                 return;
             }
+            if (importInPlace) {
+                importInPlace(tree, version);
+                return;
+            }
             // (listed before nativeImportBegin removes an earlier setup: a folder that can't be used leaves it alone)
             romfsTree = tree;
             romfsFiles.clear();
@@ -938,23 +943,6 @@ public class TOTKRecompAndroidActivity extends SDLActivity {
                 Log.i(TAG, "game code from the picked folder: " + preLib.size + " bytes");
             }
             nativeImportProgress(copied, total);
-            if (importInPlace) {  // the romfs/ where it is: its path noted, no image built (runtime/services/fs.c)
-                String at = documentPath(romfs.id);
-                romfsFiles.clear();
-                romfsPaths.clear();
-                if (at == null || !new File(at, "System/Version.txt").canRead()) {
-                    nativeImportDetail("this folder can't be used in place (" + (at == null ? romfs.id : at) +
-                            "): choose Copy them, or a folder on the phone's storage");
-                    nativeImportDone(5);
-                    return;
-                }
-                try (OutputStream o = new FileOutputStream(new File(games, "romfs.link"))) {
-                    o.write((at + "\n").getBytes(java.nio.charset.StandardCharsets.UTF_8));
-                }
-                Log.i(TAG, "game data used in place: " + at);
-                nativeImportDone(0);
-                return;
-            }
             long[] sizes = new long[romfsFiles.size()];
             for (int i = 0; i < sizes.length; i++) sizes[i] = romfsFiles.get(i).size;
             romfsOpenError = null;
@@ -987,6 +975,40 @@ public class TOTKRecompAndroidActivity extends SDLActivity {
                 getContentResolver().openFileDescriptor(DocumentsContract.buildDocumentUriUsingTree(tree, d.id), "r");
         if (pfd == null) throw new IOException("Could not open " + d.name);
         return pfd.detachFd();
+    }
+
+    // The romfs/ where it is (Use them in place): its path noted in romfs.link, no image built (runtime/services/fs.c),
+    // only exefs/ copied. Read by its path, so checked there too (nativeCheckRomfsDir) rather than listed through the file
+    // provider. TOTK's romfs/ has no System/Version.txt (BOTW's has): RegionLangMask.txt says it can be read (issue #16).
+    // Called from importGame's try, as importImage.
+    private void importInPlace(Uri tree, int version) throws IOException {
+        String at = documentPath(romfs.id);
+        if (at == null || !new File(at, "System/RegionLangMask.txt").canRead()) {
+            nativeImportDetail("this folder can't be used in place (" + (at == null ? romfs.id : at) +
+                    "): choose Copy them, or a folder on the phone's storage");
+            nativeImportDone(5);
+            return;
+        }
+        if (!nativeCheckRomfsDir(version, at)) {  // (before nativeImportBegin removes an earlier setup)
+            nativeImportDone(6);
+            return;
+        }
+        String name = DocumentsContract.getTreeDocumentId(tree);
+        File games = new File(nativeImportBegin(name.substring(name.lastIndexOf(':') + 1), version));
+        copied = reported = 0;
+        total = treeBytes(tree, exefs);
+        copyTree(tree, exefs, new File(games, "exefs"));
+        if (preLib != null && Integer.toString(version).equals(readText(tree, preGame).trim())) {
+            copyDoc(tree, preId, new File(games, "totkgame.so.id"));
+            copyDoc(tree, preLib, new File(games, "totkgame.so"));
+            Log.i(TAG, "game code from the picked folder: " + preLib.size + " bytes");
+        }
+        nativeImportProgress(copied, total);
+        try (OutputStream o = new FileOutputStream(new File(games, "romfs.link"))) {
+            o.write((at + "\n").getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        }
+        Log.i(TAG, "game data used in place: " + at);
+        nativeImportDone(0);
     }
 
     // The game files from exefs/ and a romfs.bin made already (importGame found them): the image checked from its own

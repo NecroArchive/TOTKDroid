@@ -26,6 +26,8 @@
  "Shaders com cálculo de 32 bits"},
 {"A file in the chosen folder couldn't be read. Copy the whole game folder again and try again.",
  "Um arquivo da pasta escolhida não pôde ser lido. Copie a pasta do jogo inteira de novo e tente outra vez."},
+{"These files can't be read where they are. Choose Copy them, or a folder on the phone's storage.",
+ "Esses arquivos não podem ser lidos onde estão. Escolha “Copy them” ou uma pasta no armazenamento do celular."},
 {"a button",
  "um botão"},
 {"a key",

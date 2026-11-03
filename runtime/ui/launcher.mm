@@ -212,8 +212,8 @@ static std::string check_copied_files(const std::string &root) {
         char bad[128];
         return romfs_image_ok(linked.c_str(), bad, sizeof bad) ? "" : "The game files folder was moved or can't be read";
     }
-    if (!linked.empty())  // (used in place: the player's own romfs/, runtime/services/fs.c)
-        return file_exists(linked + "/System/Version.txt") ? "" : "The game files folder was moved or can't be read";
+    if (!linked.empty())  // (used in place: the player's own romfs/, runtime/services/fs.c; TOTK's has no Version.txt)
+        return file_exists(linked + "/System/RegionLangMask.txt") ? "" : "The game files folder was moved or can't be read";
     if (!file_exists(root + "/romfs.bin")) return "Game data missing";
     char why[128];  // (a copy cut short: the game would abort at start, runtime/romfs_build.c)
     if (!romfs_image_ok((root + "/romfs.bin").c_str(), why, sizeof why)) return "Game data incomplete: set up the game files again";
@@ -692,6 +692,18 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_totkrecompandroid_TOTKRecompAndro
     return romfs_check_result(r, why, n, txt.c_str());
 }
 
+// nativeCheckRomfs for a romfs/ used in place, read by its path (the access to all files): listed here in seconds
+// instead of through the file provider, which took 20-30 minutes for its 304,000 files (issue #16)
+extern "C" JNIEXPORT jboolean JNICALL Java_com_totkrecompandroid_TOTKRecompAndroidActivity_nativeCheckRomfsDir(JNIEnv *env, jclass, jint version,
+                                                                                                            jstring dir) {
+    const char *d = env->GetStringUTFChars(dir, NULL);
+    std::string path = d ? d : "";
+    if (d) env->ReleaseStringUTFChars(dir, d);
+    char why[256] = "";
+    int r = romfs_check_dir(version, path.c_str(), why, sizeof why);
+    return romfs_check_result(r, why, -1, "");
+}
+
 static bool keep_loose(const char *rel);
 
 // A romfs.bin brought ready-made (the picked folder: exefs/ and romfs.bin - made on a PC from the game's own files, no
@@ -846,6 +858,8 @@ extern "C" JNIEXPORT void JNICALL Java_com_totkrecompandroid_TOTKRecompAndroidAc
     if (result == 5 && detail.rfind("can't read ", 0) == 0)  // (not the free space: issue #17 read it as 30 GB asked for)
         set_job("Setup didn't finish", true,
                 "A file in the chosen folder couldn't be read. Copy the whole game folder again and try again.");
+    else if (result == 5 && detail.find("can't be used in place") != std::string::npos)  // (nothing copied: not the space, #16)
+        set_job("Setup didn't finish", true, "These files can't be read where they are. Choose Copy them, or a folder on the phone's storage.");
     set_job_detail(detail);
 }
 
