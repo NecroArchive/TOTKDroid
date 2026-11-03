@@ -973,6 +973,37 @@ static void emit_tex(Ctx *c, uint64_t w, bool bindless) {
     write_tex_result(c, slot, call, mask, d, RZ, false, false);
 }
 
+// TXD (0xde38): a lookup with explicit derivatives - coordinates from gpr8, then a register with an array's layer (low
+// 16 bits) and the offsets; the derivatives from gpr20 in the order du/dx, du/dy, dv/dx, dv/dy (per coordinate, X then
+// Y). Facts from UltraTears' patch 0012 and Ryujinx's EmitTxd (after totk-pc-recomp's findings and yuzu); the code is
+// ours. TOTK's surface has a G-buffer shader with TXDs: untranslated, ~11 draws a frame were skipped (2026-11-03).
+// 1D, 2D and 2D arrays; no offsets.
+static void emit_txd(Ctx *c, uint64_t w) {
+    int d = (int)bits(w, 0, 8), a = (int)bits(w, 8, 8), b = (int)bits(w, 20, 8);
+    uint32_t index = (uint32_t)bits(w, 36, 13), mask = (uint32_t)bits(w, 31, 4);
+    int target = (int)bits(w, 29, 2);
+    bool array = bits(w, 28, 1), aoffi = bits(w, 35, 1);
+    if (!c->glsl) { fail(c, "TXD (MSL)"); return; }
+    if (target > 1 || aoffi || (array && !target)) { fail(c, "TXD %s", aoffi ? "offset" : target ? "3d/cube" : "1d array"); return; }
+    int n = target ? 2 : 1;
+    int slot = tex_slot(c, index, target ? (array ? TEXTYPE_2D_ARRAY : TEXTYPE_2D) : TEXTYPE_1D, false, array);
+    if (c->fail) return;
+    for (int i = 0; i < n + array; i++) c->reg_used[a + i] = 1;
+    for (int i = 0; i < 2 * n; i++) c->reg_used[b + i] = 1;
+    char P[256], dx[128], dy[128], call[1024];
+    if (n == 1) snprintf(P, sizeof P, "as_type<float>(r%d)", a);
+    else if (!array) snprintf(P, sizeof P, "vec2(as_type<float>(r%d), as_type<float>(r%d))", a, a + 1);
+    else snprintf(P, sizeof P, "vec3(as_type<float>(r%d), as_type<float>(r%d), float(min(r%d & 0xffffu, uint(tsize%d(0).z) - 1u)))",
+                  a, a + 1, a + 2, slot);
+    if (n == 1) { snprintf(dx, sizeof dx, "as_type<float>(r%d)", b); snprintf(dy, sizeof dy, "as_type<float>(r%d)", b + 1); }
+    else {
+        snprintf(dx, sizeof dx, "vec2(as_type<float>(r%d), as_type<float>(r%d))", b, b + 2);
+        snprintf(dy, sizeof dy, "vec2(as_type<float>(r%d), as_type<float>(r%d))", b + 1, b + 3);
+    }
+    snprintf(call, sizeof call, "textureGrad(t%d, %s, %s, %s)", slot, P, dx, dy);
+    write_tex_result(c, slot, call, mask, d, RZ, false, false);
+}
+
 // TLD4 (full form): 4-texel component gather (0xc838 / mask 0xfc38).
 static void emit_tld4(Ctx *c, uint64_t w) {
     int d = (int)bits(w, 0, 8), a = (int)bits(w, 8, 8), b = (int)bits(w, 20, 8);
@@ -1447,6 +1478,8 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         emit_tex(c, w, false);
     } else if (OPM(0xdeb8000000000000ull, 0xfff8000000000000ull)) {  // TEX.B (bindless)
         emit_tex(c, w, true);
+    } else if (OPM(0xde38000000000000ull, 0xfff8000000000000ull)) {  // TXD
+        emit_txd(c, w);
     } else if (OPM(0xc838000000000000ull, 0xfc38000000000000ull)) {  // TLD4
         emit_tld4(c, w);
     } else if (OPM(0xdf00000000000000ull, 0xff40000000000000ull)) {  // TLD4S
