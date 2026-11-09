@@ -49,14 +49,16 @@ set(IMGUI_SRC ${IMGUI}/imgui.cpp ${IMGUI}/imgui_draw.cpp ${IMGUI}/imgui_tables.c
     ${IMGUI}/backends/imgui_impl_sdl3.cpp ${IMGUI}/backends/imgui_impl_vulkan.cpp)
 
 add_library(main SHARED ${RT_SRC} ${R}/runtime/platform/android.c ${VK_SRC} ${UI_SRC} ${IMGUI_SRC}
-            ${DEPS}/volk/volk.c ${R}/android/common/guest_window.c ${R}/runtime/native_gate.S)
+            ${DEPS}/volk/volk.c ${R}/android/common/guest_window.c ${R}/runtime/native_gate.S
+            ${R}/third_party/zstd/zstddeclib.c)  # (zstd: the game's .zs files, ui/touch_controls.mm)
 # the UI sources are plain C++ apart from __APPLE__ blocks (compiled as C++ on Android)
 set_source_files_properties(${UI_SRC} PROPERTIES LANGUAGE CXX COMPILE_OPTIONS "-xc++")
 set_source_files_properties(${R}/runtime/gamelib.c PROPERTIES COMPILE_DEFINITIONS "GAMELIB_ID=\"${GAMELIB_ID}\"")
 set_source_files_properties(${R}/runtime/gamebuild.c PROPERTIES COMPILE_DEFINITIONS "GAMELIB_ID=\"${GAMELIB_ID}\"")
 
 target_include_directories(main PRIVATE ${R}/runtime ${R}/runtime/nvn ${IMGUI} ${IMGUI}/backends ${FFMPEG}/include ${DEPS}/include
-                           ${DEPS}/volk ${TOTK_GEN_DIR} ${R}/third_party/smaa/Textures ${R}/android/common)
+                           ${DEPS}/volk ${TOTK_GEN_DIR} ${R}/third_party/smaa/Textures ${R}/android/common
+                           ${R}/third_party/zstd)
 target_compile_definitions(main PRIVATE
     VK_NO_PROTOTYPES VK_USE_PLATFORM_ANDROID_KHR IMGUI_IMPL_VULKAN_USE_VOLK   # Vulkan from the loaded driver (volk)
     VMA_STATIC_VULKAN_FUNCTIONS=0 VMA_DYNAMIC_VULKAN_FUNCTIONS=1)

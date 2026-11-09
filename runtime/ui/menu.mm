@@ -555,8 +555,8 @@ static void tab_display(void) {
         bool sixty = version == 182 || version == 143;
         if (!sixty && g_settings.fps_mode > 1) g_settings.fps_mode = 1;
         static const char *fr[] = {"Auto (20 / 30)", "30 fps"};
-        static const char *fr60[] = {"Auto (30 / 60)", "30 fps", "60 fps"};
-        opt_choice("Frame rate", &g_settings.fps_mode, sixty ? fr60 : fr, sixty ? 3 : 2, 1,
+        static const char *fr60[] = {"Auto (30 / 60)", "30 fps", "60 fps", "20 fps", "40 / 45 fps"};
+        opt_choice("Frame rate", &g_settings.fps_mode, sixty ? fr60 : fr, sixty ? 5 : 2, 1,
                    sixty ? "Auto: 60 fps where your device keeps up, 30 where it doesn't (the game's clock stays right "
                            "either way). 30 fps: steady and cooler - the phone heats less. 60 fps: always aims for 60."
                          : "Auto: the game's own pacing, as on the Switch. 30 fps: never more than 30 frames a "
@@ -564,6 +564,9 @@ static void tab_display(void) {
     }
 #endif
 
+#ifdef __ANDROID__
+    if (g_settings.fps_mode == 4) ImGui::TextWrapped("%s", tr("40 fps on a 120 Hz display, 45 on 90 Hz, 30 on 60 Hz."));
+#endif
     opt_section("Rendering");
     // display order -> RES_* (the ini / enum order predates the menu order)
     // (up to 4x: 7680 x 4320, 8K - more only ran out of GPU memory, and sat next to 75% in the list)
@@ -739,6 +742,15 @@ static void tab_about(void) {
     hint("The phone's gyroscope - or a controller's that has one - aims the bow and the Purah Pad's camera and tilts "
          "the shrines' motion puzzles, as the Switch's motion controls do. The game's own options can turn motion "
          "aiming off.");
+    {
+        static const char *const sources[] = {"Auto", "Phone", "Controller"};
+        if (choice("Motion sensor", &g_settings.motion_source, sources, 3)) settings_save();  // (runtime/hle/motion.c)
+    }
+    hint("Auto: a controller's gyroscope once it sends live readings, the phone's otherwise. Phone: always the phone's - "
+         "for a controller that says it has a gyroscope but doesn't. Controller: only the controller's.");
+    if (toggle("Phone motion like the Switch's screen", &g_settings.motion_flat)) settings_save();  // (hle/motion.c, #211 #247)
+    hint("Off: the phone moves the aim as a controller would. On: as the Switch's own screen in handheld mode - try it if "
+         "tilting the phone turns the aim, and turning it tilts.");
     ImGui::Spacing();
     controls_bindings_draw(ImGui::GetFontSize() / 34);
     ImGui::Spacing();

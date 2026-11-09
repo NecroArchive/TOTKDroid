@@ -39,6 +39,10 @@ static void dyn_update(double now, double gpu_ms) {
     // assumed there, frames of 19-22 ms looked like room and its dynamic resolution rose to the top, 2026-10-31)
     double want = framepace_on() && framepace_target() > 0 ? 1000.0 / framepace_target()
                 : g_present_vsyncs > 0 ? 1000.0 / 60 * g_present_vsyncs : 1000.0 / 30;
+#ifdef __ANDROID__
+    if (g_settings.fps_mode == 3) want = 50.0;
+    else if (g_settings.fps_mode == 4) { extern int vk_between_fps(void); want = 1000.0 / vk_between_fps(); }
+#endif
     g_dyn_dt_sum += dt;
     g_dyn_n++;
     if (gpu_ms >= 0) { g_dyn_gpu_sum += gpu_ms; g_dyn_gpu_n++; }

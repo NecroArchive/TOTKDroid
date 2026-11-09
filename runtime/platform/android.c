@@ -15,6 +15,7 @@
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdarg.h>
+#include <malloc.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -266,6 +267,21 @@ void plat_write_tracking_enable(uint64_t lo, uint64_t hi) {
 // taken for ours; not on the POCO F7 Ultra with the same path. wt_odd counts those (the crash report shows it).
 static uint64_t wt_odd, wt_odd_addr;
 static int wt_odd_repeats;
+
+// Each page made read-only or writable on its own splits the window's mapping: after a long session the process runs
+// into Android's limit on mappings (~65000), mprotect fails, the page written to stays read-only, and the same store
+// faults until it is taken for a real fault - a crash in the game's code on a page marked written (BOTWRecompAndroid
+// 1f9c7be, Mali-G720, #196; "page tracking 2"). Then the whole window is made writable again in one call (a single
+// mapping), every page counts as written (state 0), and tracking starts over from there. (wt_lock held; signal-safe: no
+// allocation, no logging.)
+static volatile int wt_reopened;  // (times it happened: plat_written_pages logs it)
+static bool wt_reopen_all(void) {
+    if (mprotect((void *)(uintptr_t)wt_lo, wt_hi - wt_lo, PROT_READ | PROT_WRITE)) return false;
+    memset(wt_state, 0, (size_t)((wt_hi - wt_lo) >> 12));
+    wt_reopened++;
+    return true;
+}
+
 static bool wt_fault(uint64_t a) {
     if (!wt_state || a < wt_lo || a >= wt_hi) return false;
     uint64_t p = (a - wt_lo) >> 12, np = (wt_hi - wt_lo) >> 12;
@@ -281,12 +297,18 @@ static bool wt_fault(uint64_t a) {
     for (uint64_t k = p; k < p + 2 && k < np; k++) {
         if (k != p && wt_state[k] != 1) continue;
         if (k == p && wt_state[k] == 0) {  // (untracked: writable unless mprotect can't make it so - a real fault)
-            if (mprotect((void *)(uintptr_t)(wt_lo + (k << 12)), 4096, PROT_READ | PROT_WRITE)) break;
+            if (mprotect((void *)(uintptr_t)(wt_lo + (k << 12)), 4096, PROT_READ | PROT_WRITE)) {
+                if (errno == ENOMEM && wt_reopen_all()) ours = true;  // (out of mappings, above)
+                break;
+            }
             ours = true;
             continue;
         }
         wt_state[k] = 2;
-        mprotect((void *)(uintptr_t)(wt_lo + (k << 12)), 4096, PROT_READ | PROT_WRITE);
+        if (mprotect((void *)(uintptr_t)(wt_lo + (k << 12)), 4096, PROT_READ | PROT_WRITE)) {
+            ours = wt_reopen_all();  // (out of mappings, above; else it stays a fault)
+            break;
+        }
         ours = true;
     }
     wt_unlock();
@@ -318,9 +340,78 @@ void plat_write_prepare(uint64_t addr, uint64_t size) {
 int plat_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, int max, uint64_t *page) {
     if (!wt_state || addr < wt_lo || addr + size > wt_hi) return -1;
     *page = 4096;
+    {   // (the process's mappings, every 5 minutes - how near the limit the tracked pages bring it; and wt_reopen_all)
+        static int logged;
+        static uint64_t next;
+        uint64_t now = plat_now_ns();
+        if (wt_reopened != logged) {
+            logged = wt_reopened;
+            fprintf(stderr, "[android] page write tracking: out of memory mappings, the window reopened whole (%d)\n", logged);
+        }
+        if (now >= next) {
+            // (and whose: the tracked window's own, the GPU driver's device files, the rest - on a Mali the count stayed
+            // at 62000 after the window was reopened whole, #249: not all of them the tracking's)
+            static long every = -1;  // (LARECOMP_LOG_MAPS_S=<s>: another interval, a test)
+            if (every < 0) every = getenv("LARECOMP_LOG_MAPS_S") && atol(getenv("LARECOMP_LOG_MAPS_S")) > 0 ? atol(getenv("LARECOMP_LOG_MAPS_S")) : 300;
+            next = now + (uint64_t)every * 1000000000ull;
+            FILE *f = fopen("/proc/self/maps", "r");
+            int n = 0, in_window = 0, gpu = 0;
+            char line[512];
+            struct { char name[40]; int n; } top[24];  // (the others by name: [anon:scudo...], a library, a device)
+            int ntop = 0;
+            while (f && fgets(line, sizeof line, f)) {
+                n++;
+                unsigned long long lo = strtoull(line, NULL, 16);
+                if (lo >= wt_lo && lo < wt_hi) { in_window++; continue; }
+                if (strstr(line, "/dev/mali") || strstr(line, "/dev/kgsl") || strstr(line, "dmabuf") || strstr(line, "/dev/dri"))
+                    gpu++;
+                char *nm = line;  // (the 6th field: after five spaces-separated ones)
+                for (int k = 0; k < 5 && nm; k++) { nm = strchr(nm, ' '); while (nm && *nm == ' ') nm++; }
+                char key[40];
+                snprintf(key, sizeof key, "%s", nm && *nm && *nm != '\n' ? nm : "(no name)");
+                key[strcspn(key, "\n")] = 0;
+                if (key[0] == '[') key[strcspn(key, ":]") + 1 < sizeof key ? strcspn(key, "]") + 1 : sizeof key - 1] = 0;
+                int t = 0;
+                while (t < ntop && strcmp(top[t].name, key)) t++;
+                if (t == ntop && ntop < 24) snprintf(top[ntop].name, sizeof top[ntop].name, "%s", key), top[ntop++].n = 0;
+                if (t < ntop) top[t].n++;
+            }
+            if (f) fclose(f);
+            char most[160] = "";
+            for (int r = 0, len = 0; r < 3; r++) {  // (the three most)
+                int best = -1;
+                for (int t = 0; t < ntop; t++) if (top[t].n > 0 && (best < 0 || top[t].n > top[best].n)) best = t;
+                if (best < 0) break;
+                len += snprintf(most + len, sizeof most - len, "%s%s %d", r ? ", " : "", top[best].name, top[best].n);
+                top[best].n = -top[best].n;
+            }
+            fprintf(stderr, "[android] memory mappings: %d (the game's memory %d, the GPU driver's %d, other %d; most: %s)\n", n,
+                    in_window, gpu, n - in_window - gpu, most);
+            {   // whose the mallocs are (#249: [anon:scudo:secondary] grew ~2000 every 5 minutes on a Mali)
+                extern int g_cmd_shadow_pages, g_cmd_host_chunks, vk_live_counts(char *out, int cap);
+                struct mallinfo mi = mallinfo();
+                char vk[256] = "";
+                vk_live_counts(vk, sizeof vk);
+                fprintf(stderr, "[android] malloc %zu MB in use (%zu MB mapped by large blocks); command shadow pages %d, host "
+                        "command chunks %d; %s\n", (size_t)mi.uordblks >> 20, (size_t)mi.hblkhd >> 20, g_cmd_shadow_pages,
+                        g_cmd_host_chunks, vk);
+            }
+        }
+    }
     uint64_t p0 = (addr - wt_lo) >> 12, p1 = (addr + size - wt_lo + 0xFFF) >> 12;
     int n = 0;
     wt_lock();
+    {   // LARECOMP_WT_REOPEN_TEST=<s> (test): the out-of-mappings path (wt_reopen_all) taken every that many seconds
+        static int every = -1;
+        static uint64_t next;
+        if (every < 0) every = getenv("LARECOMP_WT_REOPEN_TEST") ? atoi(getenv("LARECOMP_WT_REOPEN_TEST")) : 0;
+        uint64_t now = plat_now_ns();
+        if (every > 0 && now >= next) {
+            bool first = !next;
+            next = now + (uint64_t)every * 1000000000ull;
+            if (!first && wt_reopen_all()) { wt_unlock(); return -1; }
+        }
+    }
     for (uint64_t p = p0; p < p1;) {
         if (wt_state[p] == 1) { p++; continue; }
         uint64_t q = p;
@@ -332,6 +423,8 @@ int plat_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, int max, u
             // (state first, then the protection: a write in between lands before the caller copies the page)
             for (uint64_t k = p; k < q; k++) wt_state[k] = 1;
             if (mprotect((void *)(uintptr_t)(wt_lo + (p << 12)), (q - p) << 12, PROT_READ)) {
+                if (errno == ENOMEM && wt_reopen_all()) { wt_unlock(); return -1; }  // (out of mappings: start over - all
+                                                                                    // counts as written, wt_reopen_all)
                 for (uint64_t k = p; k < q; k++) wt_state[k] = 0;
                 mprotect((void *)(uintptr_t)(wt_lo + (p << 12)), (q - p) << 12, PROT_READ | PROT_WRITE);
                 wt_broken = true;
@@ -463,6 +556,68 @@ void plat_print_backtrace(void) {
     }
 }
 
+// The game's code reading the null page (an address under 64 KB): the load answers zero and the code goes on. The game
+// checks some pointers that are still being set up only by what they point to - a rune's or the Slate camera's target
+// tag (0x88 off a null or -1 pointer, #235 #241 #247) - and both modes crashed there. Only plain loads into general
+// registers (LDR / LDRB / LDRH / LDRS*, LDP) without a base write-back; in the game's code only (recompiled:
+// totkgame.so; Native: the guest window). Each place logged once. LARECOMP_NO_NULL_READS=1: off.
+static bool null_read(ucontext_t *uc, uint64_t fa, uint64_t pc) {
+    static int off = -1;
+    if (off < 0) off = getenv("LARECOMP_NO_NULL_READS") != NULL;
+    if (off || fa >= 0x10000 || (pc & 3)) return false;
+    bool game = pc >= GUEST_LO && pc < GUEST_HI;
+    if (!game) {
+        Dl_info di = {0};
+        game = dladdr((void *)(uintptr_t)pc, &di) && di.dli_fname && strstr(di.dli_fname, "totkgame");
+    }
+    if (!game) return false;
+    uint32_t in = *(const uint32_t *)(uintptr_t)pc;
+    if (in & (1u << 26)) return false;  // SIMD/FP loads need vector registers, not uc_mcontext.regs.
+    int rt = in & 31, rt2 = -1;
+    if ((in & 0x3B000000u) == 0x39000000u) {  // (LDR* unsigned offset: opc 01, or 10 / 11 sign-extending but PRFM)
+        int opc = (in >> 22) & 3, size = in >> 30;
+        if (opc == 0 || (opc == 2 && size == 3)) return false;
+    } else if ((in & 0x3B200C00u) == 0x38000000u || (in & 0x3B200C00u) == 0x38200800u) {  // (unscaled; register offset)
+        int opc = (in >> 22) & 3, size = in >> 30;
+        if (opc == 0 || (opc == 2 && size == 3)) return false;
+    } else if ((in & 0x3BC00000u) == 0x29400000u) {  // (LDP / LDPSW, signed offset: no write-back)
+        rt2 = (in >> 10) & 31;
+    } else return false;
+    if (rt < 31) uc->uc_mcontext.regs[rt] = 0;
+    if (rt2 >= 0 && rt2 < 31) uc->uc_mcontext.regs[rt2] = 0;
+    uc->uc_mcontext.pc = pc + 4;
+    static uint64_t seen[32];
+    static int nseen;
+    bool known = false;
+    for (int i = 0; i < nseen && !known; i++) known = seen[i] == pc;
+    if (!known && nseen < 32) {
+        seen[nseen++] = pc;
+        Dl_info di = {0};
+        uint64_t mo = dladdr((void *)(uintptr_t)pc, &di) ? pc - (uint64_t)(uintptr_t)di.dli_fbase : pc;
+        fprintf(stderr, "[android] the game's code read address %#llx: zero, and on (%s+%llx, lr %llx)\n",
+                (unsigned long long)fa, game && pc >= GUEST_LO && pc < GUEST_HI ? "guest" : "totkgame.so",
+                (unsigned long long)mo, (unsigned long long)uc->uc_mcontext.regs[30]);
+    }
+    return true;
+}
+
+// Native mode: the game's code calling a null function pointer (often one null_read just gave as zero) - the CPU jumps
+// to an address under 64 KB and faults there. Back to the caller with 0, as Recompiled mode does (dispatch.c
+// null_call): a Mali-G720 on 1.0.0 crashed so at "Open your eyes" (#305, after a read at 0x20). Only when the return
+// address is the game's code. LARECOMP_NO_NULL_CALLS=1: off.
+static bool null_call_native(ucontext_t *uc, uint64_t pc) {
+    static int off = -1;
+    if (off < 0) off = getenv("LARECOMP_NO_NULL_CALLS") != NULL;
+    uint64_t lr = uc->uc_mcontext.regs[30];
+    if (off || pc >= 0x10000 || lr < GUEST_LO || lr >= GUEST_HI || (lr & 3)) return false;
+    uc->uc_mcontext.regs[0] = 0;
+    uc->uc_mcontext.pc = lr;
+    static int n;
+    if (n++ < 10) fprintf(stderr, "[android] the game's code called address %#llx: returned 0 (lr %llx)\n",
+                          (unsigned long long)pc, (unsigned long long)lr);
+    return true;
+}
+
 // (installed through ART's signal chain: ART still handles its own faults first)
 static void crash_handler(int sig, siginfo_t *si, void *ctx) {
     ucontext_t *uc = ctx;
@@ -478,6 +633,11 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx) {
             if (h->magic == ESR_MAGIC) { g_fault_wnr = (int)((((struct esr_context *)h)->esr >> 6) & 1); break; }
     }
     if (rt_fault_watch(fa, pc)) return;  // (debugging watches first: a watched page may be write-tracked too)
+    {   // (the null page read: zero, above)
+        extern int g_fault_wnr;
+        if (sig == SIGSEGV && pc < 0x10000 && null_call_native(uc, pc)) return;
+        if (sig == SIGSEGV && g_fault_wnr != 1 && null_read(uc, fa, pc)) return;
+    }
     if (sig == SIGSEGV && wt_fault(fa)) return;  // (write tracking - whatever the code: mprotect decides, #70)
     if (sig == SIGSEGV) {  // (what the next report needs: the kernel's code, and the page's tracking state)
         extern int g_fault_wnr;
@@ -712,6 +872,39 @@ static void uclamp_min_thread(void) {
     static atomic_int logged;
     if (!atomic_exchange(&logged, 1))
         LOG("[android] uclamp.min %d for the game's threads: %s\n", want, r ? strerror(errno) : "ok");
+}
+
+// The render thread (vulkan/async.c, ours: no part of the game's job system that LARECOMP_PIN broke) on the fastest
+// cores. Left to the scheduler on a Galaxy Tab A9+ (Snapdragon 695: 2 x A78, 6 x A55) it sat on a little core,
+// 90 ms a frame translating the world, while the game's thread had a big one (2026-11-08). Default: on low RAM
+// (vulkan/exec.c vk_low_ram - the weak phones); LARECOMP_RENDER_BIG=1 / 0.
+void plat_render_thread_pin(void) {
+    const char *e = getenv("LARECOMP_RENDER_BIG");
+    extern bool vk_low_ram(void);
+    if (e ? !atoi(e) : !vk_low_ram()) return;
+    long best = 0, mhz[64] = {0};
+    int n = 0;
+    for (int c = 0; c < 64; c++) {
+        char path[96];
+        snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", c);
+        FILE *f = fopen(path, "re");
+        if (!f) continue;
+        if (fscanf(f, "%ld", &mhz[c]) != 1) mhz[c] = 0;
+        fclose(f);
+        if (mhz[c] > best) best = mhz[c];
+        n = c + 1;
+    }
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    int k = 0;
+    for (int c = 0; c < n; c++)
+        if (mhz[c] == best) {
+            CPU_SET(c, &set);
+            k++;
+        }
+    if (!best || k == 0 || k == n) return;
+    int r = sched_setaffinity(0, sizeof set, &set);
+    LOG("[android] render thread on the %d fastest cores (%ld MHz): %s\n", k, best / 1000, r ? strerror(errno) : "ok");
 }
 
 void plat_thread_unpin(void) {

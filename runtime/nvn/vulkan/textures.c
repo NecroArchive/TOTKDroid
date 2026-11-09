@@ -534,6 +534,22 @@ static void create_image(NvnTexture *t, TexBackend *b) {
     if (type == VK_IMAGE_TYPE_2D && layers >= 6 && tw == th && samples == 1) flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
     if (type == VK_IMAGE_TYPE_3D && (usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))
         flags |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;  // (its slices rendered to through 2D views: vk_view)
+    {   // Low RAM (exec.c vk_low_ram, or LARECOMP_HALF_TEXTURES=1 / 0): a mipmapped texture the game only samples starts
+        // at its second level - a quarter of the memory. A 4 GB tablet ran out of memory loading the world with 330 MB
+        // of textures on the GPU (Galaxy Tab A9+, 2026-11-08). Not render targets, linear or small ones.
+        static int half = -1;
+        if (half < 0) {
+            extern bool vk_low_ram(void);
+            const char *e = getenv("LARECOMP_HALF_TEXTURES");
+            half = e ? atoi(e) != 0 : vk_low_ram();
+            if (half) LOG("[vk] textures from their second level (half size): low RAM\n");
+        }
+        b->skip = 0;
+        if (half && !depthfmt && b->rs_group == RS_NONE && !(t->flags & (8 | 0x50)) && type == VK_IMAGE_TYPE_2D &&
+            samples == 1 && levels >= 2 && t->layout.levels >= 2 && tw >= 128 && th >= 128) {
+            tw >>= 1, th >>= 1, levels--, b->skip = 1;
+        }
+    }
     VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = flags, .imageType = type, .format = vf,
                             .extent = {tw, th, depth}, .mipLevels = levels, .arrayLayers = layers,
                             .samples = (VkSampleCountFlagBits)samples, .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = usage,
@@ -628,7 +644,35 @@ void vk_dl_note_upload(void *img, uint32_t w, uint32_t h, uint32_t lv);  // (exe
 static uint32_t level_w(const TexBackend *b, uint32_t lv) { uint32_t v = b->width >> lv; return v ? v : 1; }
 static uint32_t level_h(const TexBackend *b, uint32_t lv) { uint32_t v = b->height >> lv; return v ? v : 1; }
 
+#ifdef __ANDROID__
+static void bc_shadow_destroy(TexBackend *b);
+
+// wb x hb blocks of a BC texture the GPU lacks (bsize bytes each, rows of blocks) decoded into level lv of its image,
+// at layer (3D: slice z); the decoded size. *decode_ns (when given): the decode's time.
+static uint64_t bc_upload_blocks(VkCommandBuffer cb, TexBackend *b, const uint8_t *blocks, uint32_t wb, uint32_t hb,
+                                 uint32_t bsize, uint32_t lv, uint32_t layer, uint32_t z, uint64_t *decode_ns) {
+    uint32_t bpp;
+    bc_target(b->bc_vf, &bpp);
+    uint64_t out_size = bpp ? (uint64_t)wb * 4 * hb * 4 * bpp : (uint64_t)wb * hb * 16;
+    VkSpan s = vk_transient(out_size, 16);
+    uint64_t decode_start = decode_ns ? SDL_GetTicksNS() : 0;
+    if (bpp) bc_decode(b->bc_vf, blocks, wb, hb, bsize, s.ptr, bpp);
+    else bc1_to_astc(blocks, s.ptr, (uint64_t)wb * hb);
+    if (decode_ns) *decode_ns = SDL_GetTicksNS() - decode_start;
+    uint32_t iw = level_w(b, lv), ih = level_h(b, lv);
+    VkBufferImageCopy rg = {.bufferOffset = s.off, .bufferRowLength = wb * 4, .bufferImageHeight = hb * 4,
+                            .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, lv, layer, 1}, .imageOffset = {0, 0, (int32_t)z},
+                            .imageExtent = {iw < wb * 4 ? iw : wb * 4, ih < hb * 4 ? ih : hb * 4, 1}};
+    vk_dl_note_upload((void *)b->image, rg.imageExtent.width, rg.imageExtent.height, lv);
+    vkCmdCopyBufferToImage(cb, s.buf, b->image, VK_IMAGE_LAYOUT_GENERAL, 1, &rg);
+    return out_size;
+}
+#endif
+
 static void destroy_image(TexBackend *b) {
+#ifdef __ANDROID__
+    bc_shadow_destroy(b);
+#endif
     views_forget(b);
     if (b->image || b->mem) defer((Dead){.img = b->image, .mem = b->mem});  // (never the same allocation twice)
     b->image = VK_NULL_HANDLE;
@@ -638,6 +682,20 @@ static void destroy_image(TexBackend *b) {
 // Live game textures: an in-place reboot (vk_textures_reset) destroys them all.
 static NvnTexture **g_live;
 static int g_nlive, g_cap_live;
+// Their images' bytes on the GPU (the memory mappings log), *targets: the render targets' share (any thread: a racy sum)
+uint64_t vk_texture_bytes(uint64_t *targets) {
+    uint64_t all = 0, rt = 0;
+    for (int i = 0; i < g_nlive; i++) {
+        TexBackend *b = g_live[i] ? g_live[i]->backend : NULL;
+        if (!b || !b->mem) continue;
+        VmaAllocationInfo info;
+        vmaGetAllocationInfo(g_vk.vma, b->mem, &info);
+        all += info.size;
+        if (vk_texture_scale_group(g_live[i]) != RS_NONE || renderer_format_is_depth(g_live[i]->format)) rt += info.size;
+    }
+    if (targets) *targets = rt;
+    return all;
+}
 int vk_texture_count(void) {
     static int log_diag = -1;
     if (log_diag < 0) log_diag = getenv("LARECOMP_LOG_TEXDIAG") ? 1 : 0;
@@ -1037,10 +1095,11 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
     extern uint64_t nvn_linear_rt_pitch(uint64_t row_bytes);
     bool linear = (t->flags & 0x50) != 0;
 #define LIN_STRIDE(row_bytes) ((t->flags & 0x10) ? t->stride : nvn_linear_rt_pitch(row_bytes))
-    uint32_t levels = t->layout.levels < b->levels ? t->layout.levels : b->levels;
+    uint32_t levels = t->layout.levels < b->levels + b->skip ? t->layout.levels : b->levels + b->skip;  // (guest levels; b->skip: the image starts at that one)
     for (uint32_t layer = 0; layer < layers; layer++) {
-        for (uint32_t lv = 0; lv < levels; lv++) {
+        for (uint32_t lv = b->skip; lv < levels; lv++) {
             LevelLayout l = tegra_level(&t->layout, lv);
+            uint32_t il = lv - b->skip;  // (the image's level)
             if (b->astc_bw) {  // blocks -> linear block rows -> RGBA8 texels
                 const uint8_t *src = (const uint8_t *)(uintptr_t)t->addr + layer * layer_size + l.offset;
                 uint8_t *blocks = texture_scratch((uint64_t)l.wb * l.hb * 16);
@@ -1052,33 +1111,23 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
                 astc_decode_ldr(blocks, l.w, l.h, b->astc_bw, b->astc_bh, b->astc_srgb, s.ptr);
                 uint64_t decode_ns = decode_start ? SDL_GetTicksNS() - decode_start : 0;
                 VkBufferImageCopy rg = {.bufferOffset = s.off, .bufferRowLength = l.w, .bufferImageHeight = l.h,
-                                        .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, lv, layer, 1},
-                                        .imageExtent = {l.w < level_w(b, lv) ? l.w : level_w(b, lv), l.h < level_h(b, lv) ? l.h : level_h(b, lv), 1}};
+                                        .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, il, layer, 1},
+                                        .imageExtent = {l.w < level_w(b, il) ? l.w : level_w(b, il), l.h < level_h(b, il) ? l.h : level_h(b, il), 1}};
                 vk_dl_note_upload((void *)b->image, rg.imageExtent.width, rg.imageExtent.height, rg.imageSubresource.mipLevel);
                 vkCmdCopyBufferToImage(cb, s.buf, b->image, VK_IMAGE_LAYOUT_GENERAL, 1, &rg);
                 texture_trace_record(TEX_TRACE_ASTC, (uint64_t)l.wb * l.hb * 16, (uint64_t)l.w * l.h * 4, decode_ns);
                 continue;
             }
 #ifdef __ANDROID__
-            if (b->bc_vf) {  // blocks -> linear block rows -> texels (bc_decode)
-                uint32_t bsize = fi->bpb, bpp;
-                bc_target(b->bc_vf, &bpp);
+            if (b->bc_vf) {  // blocks -> linear block rows -> texels (bc_upload_blocks)
+                uint32_t bsize = fi->bpb;
                 const uint8_t *src = (const uint8_t *)(uintptr_t)t->addr + layer * layer_size + l.offset;
                 uint8_t *blocks = texture_scratch((uint64_t)l.wb * l.hb * bsize);
                 if (linear) for (uint32_t y = 0; y < l.hb; y++) memcpy(blocks + (uint64_t)y * l.wb * bsize, src + (uint64_t)y * LIN_STRIDE(l.wb * bsize), l.wb * bsize);
                 else tegra_deswizzle(src, blocks, l.wb, l.hb, 1, bsize, l.block_height_log2, l.block_depth_log2);
                 if (b->tp > 0 && layer == 0) texpatch_apply(b->tp - 1, lv, blocks, l.w, l.h, l.wb * bsize);
-                uint64_t out_size = bpp ? (uint64_t)l.wb * 4 * l.hb * 4 * bpp : (uint64_t)l.wb * l.hb * 16;
-                VkSpan s = vk_transient(out_size, 16);
-                uint64_t decode_start = texture_trace_on() ? SDL_GetTicksNS() : 0;
-                if (bpp) bc_decode(b->bc_vf, blocks, l.wb, l.hb, bsize, s.ptr, bpp);
-                else bc1_to_astc(blocks, s.ptr, (uint64_t)l.wb * l.hb);
-                uint64_t decode_ns = decode_start ? SDL_GetTicksNS() - decode_start : 0;
-                VkBufferImageCopy rg = {.bufferOffset = s.off, .bufferRowLength = l.wb * 4, .bufferImageHeight = l.hb * 4,
-                                        .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, lv, layer, 1},
-                                        .imageExtent = {l.w < level_w(b, lv) ? l.w : level_w(b, lv), l.h < level_h(b, lv) ? l.h : level_h(b, lv), 1}};
-                vk_dl_note_upload((void *)b->image, rg.imageExtent.width, rg.imageExtent.height, rg.imageSubresource.mipLevel);
-                vkCmdCopyBufferToImage(cb, s.buf, b->image, VK_IMAGE_LAYOUT_GENERAL, 1, &rg);
+                uint64_t decode_ns = 0;
+                uint64_t out_size = bc_upload_blocks(cb, b, blocks, l.wb, l.hb, bsize, il, layer, 0, texture_trace_on() ? &decode_ns : NULL);
                 texture_trace_record(TEX_TRACE_BC, (uint64_t)l.wb * l.hb * bsize, out_size, decode_ns);
                 continue;
             }
@@ -1145,16 +1194,16 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
             // target sized) can still be filled from the CPU - the save slots' screenshots on the title screen. Its
             // full-size data overran the scaled image (only the width was clamped): GPU writes past the allocation,
             // a device loss below 1x after a seed switch.
-            if (w > level_w(b, lv)) w = level_w(b, lv);
-            if (hh > level_h(b, lv)) hh = level_h(b, lv);
+            if (w > level_w(b, il)) w = level_w(b, il);
+            if (hh > level_h(b, il)) hh = level_h(b, il);
             VkBufferImageCopy rg = {.bufferOffset = s.off, .bufferRowLength = l.wb * fi->bw, .bufferImageHeight = l.hb * fi->bh,
-                                    .imageSubresource = {b->aspect & VK_IMAGE_ASPECT_DEPTH_BIT ? VK_IMAGE_ASPECT_DEPTH_BIT : b->aspect, lv,
+                                    .imageSubresource = {b->aspect & VK_IMAGE_ASPECT_DEPTH_BIT ? VK_IMAGE_ASPECT_DEPTH_BIT : b->aspect, il,
                                                          b->depth > 1 ? 0 : layer, 1},
                                     .imageExtent = {w, b->base_type == VK_IMAGE_VIEW_TYPE_1D || b->base_type == VK_IMAGE_VIEW_TYPE_1D_ARRAY ? 1 : hh,
                                                     b->depth > 1 ? d : 1}};
             if (b->aspect == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) continue;  // packed D/S: no CPU layout
             if (b->scalable && b->aspect == VK_IMAGE_ASPECT_COLOR_BIT && b->depth == 1 &&
-                (l.w != level_w(b, lv) || l.h != level_h(b, lv))) {  // (guest-size texels into a scaled allocation)
+                (l.w != level_w(b, il) || l.h != level_h(b, il))) {  // (guest-size texels into a scaled allocation)
                 upload_scaled(cb, b, s, rg, l.w, l.h);
                 continue;
             }
@@ -1291,6 +1340,18 @@ static VkImageViewType view_type_for(int textype) {
 static const VkComponentMapping IDENTITY = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
                                             VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
 
+// Draws into 3D textures (vk_view): LARECOMP_3D_RT=0 none / 1 level 0 only / 2 every level (default: 2, 0 on
+// Qualcomm's driver, which lost the device on them)
+static int rt3d_mode(void) {
+    static int rt3d = -1;
+    if (rt3d < 0) {
+        extern bool vk_driver_is_qualcomm(void);
+        const char *e = getenv("LARECOMP_3D_RT");
+        rt3d = e ? atoi(e) : vk_driver_is_qualcomm() ? 0 : 2;
+    }
+    return rt3d;
+}
+
 // render: attachment view (one level, one layer). Otherwise a sampled view of type want_textype (TEXTYPE_*),
 // with the NVN component swizzle, converting between compatible types the way renderer.m does.
 VkImageView vk_view(NvnTexture *t, const NvnTextureView *v, bool has_view, bool render, int want_textype) {
@@ -1305,13 +1366,27 @@ VkImageView vk_view(NvnTexture *t, const NvnTextureView *v, bool has_view, bool 
 #endif
     }
     uint32_t lv0 = v && (v->setmask & 1) ? v->base_level : 0;
-    uint32_t nlv = v && (v->setmask & 1) && v->num_levels ? v->num_levels : b->levels - (lv0 < b->levels ? lv0 : 0);
+    uint32_t nlv = v && (v->setmask & 1) && v->num_levels ? v->num_levels : b->levels + b->skip - lv0;
+    if (b->skip) {  // (the guest's levels, the image's from b->skip on: create_image)
+        uint32_t cut = lv0 < b->skip ? b->skip - lv0 : 0;
+        lv0 = lv0 > b->skip ? lv0 - b->skip : 0;
+        nlv = nlv > cut ? nlv - cut : 1;
+    }
+    if (!b->skip && !(v && (v->setmask & 1) && v->num_levels)) nlv = b->levels - (lv0 < b->levels ? lv0 : 0);
     uint32_t ly0 = v && (v->setmask & 2) ? v->min_layer : 0;
     uint32_t nly = v && (v->setmask & 2) && v->num_layers ? v->num_layers : b->layers - (ly0 < b->layers ? ly0 : 0);
     if (lv0 >= b->levels) lv0 = b->levels - 1;
     if (lv0 + nlv > b->levels) nlv = b->levels - lv0;
     if (ly0 >= b->layers) ly0 = b->layers - 1;
     if (ly0 + nly > b->layers) nly = b->layers - ly0;
+#ifdef __ANDROID__
+    if (render && b->bc_vf) {  // (a BC texture this GPU lacks, drawn into without a shadow image - vk_bc_shadow_view: the
+        static int logged;     // draw lands in the decoded texels)
+        if (logged++ < 4)
+            LOG("[vk] BC texture decoded on the CPU drawn into without a shadow: %ux%u fmt %d, view fmt %d, level %u layer %u\n",
+                b->width, b->height, (int)b->bc_vf, v && (v->setmask & 4) ? (int)fmt_of(v->format).vf : -1, lv0, ly0);
+    }
+#endif
     if (render) {
         if (b->base_type == VK_IMAGE_VIEW_TYPE_3D) {
             // A 3D target: one slice (the view's layer is its depth index at that level) as a 2D view - the image is
@@ -1320,13 +1395,7 @@ VkImageView vk_view(NvnTexture *t, const NvnTextureView *v, bool has_view, bool 
             // 32x32x32 volume, slice by slice.
             // Qualcomm's own driver lost the device on these draws (at the title screen, 2026-10-25: bisected to
             // bde9d0e): there, as before it, no view - those draws are skipped and the menu's background stays black.
-            // LARECOMP_3D_RT=0 none / 1 level 0 only / 2 every level (default: 2, 0 on Qualcomm's driver).
-            static int rt3d = -1;
-            if (rt3d < 0) {
-                extern bool vk_driver_is_qualcomm(void);
-                const char *e = getenv("LARECOMP_3D_RT");
-                rt3d = e ? atoi(e) : vk_driver_is_qualcomm() ? 0 : 2;
-            }
+            int rt3d = rt3d_mode();
             static int n3d;  // (which games draw so: TOTK's first frames on Qualcomm's driver lost the device too)
             if (n3d++ < 4) LOG("[vk] 3D target %ux%ux%u level %u: %s\n", t->width, t->height, b->depth, lv0,
                                rt3d == 0 || (rt3d == 1 && lv0 > 0) ? "skipped (LARECOMP_3D_RT)" : "a slice as 2D");
@@ -1396,6 +1465,257 @@ VkImageView vk_view(NvnTexture *t, const NvnTextureView *v, bool has_view, bool 
     if (nlog++ < 30) LOG("[tex] type mismatch: want %d have %d (%ux%ux%u target %u fmt %#x layers %u)\n", want, have, t->width,
                          t->height, t->depth, t->target, t->format, b->layers);
     return vk_dummy_view(want_textype);
+}
+
+#ifdef __ANDROID__
+// ---- BC textures the GPU compresses into, on a GPU without BC. BOTW makes its 32x32x32 BC4 noise volume so, once
+// after loading: each slice and mip drawn through a view in a format of the block's size (8 bytes: a texel a block).
+// Its image here holds the decoded texels (R8), and those block texels went into it as colours - the volume read
+// zero, and the fast-travel dissolve lost its noise: a flat dark-blue Link that vanished all at once, never breaking
+// up (Mali-G925, 2026-11-03). Such draws go to a shadow image in the view's format at the block grid instead; before
+// the texture is next read (a pass that doesn't draw into it, a dispatch, a copy, the present) the blocks drawn come
+// back to the CPU (one wait on the GPU each time) and are decoded into the image.
+typedef struct BcShadow {
+    TexBackend img;      // level lv holds bc_blocks() of the texture's level lv (wider when that isn't a power of two)
+    uint32_t bsize;      // bytes a block
+    uint32_t first[16];  // level lv's slices (3D) / layers: drawn[first[lv] + z]
+    uint8_t *drawn;      // drawn into since the last decode - only those decoded (the rest of the shadow is undefined)
+    bool dirty;
+} BcShadow;
+static TexBackend *bc_dirty[16];  // (the textures with a dirty shadow: a pass's targets at most)
+static int nbc_dirty;
+
+static uint32_t bc_blocks(uint32_t v, uint32_t lv) { v >>= lv; return ((v ? v : 1) + 3) / 4; }  // (a level's extent in blocks)
+static uint32_t level_slices(const TexBackend *b, uint32_t lv) {
+    if (b->base_type != VK_IMAGE_VIEW_TYPE_3D) return b->layers;
+    uint32_t v = b->depth >> lv;
+    return v ? v : 1;
+}
+
+static void bc_shadow_destroy(TexBackend *b) {
+    BcShadow *s = b->bc_shadow;
+    for (int i = 0; i < nbc_dirty; i++)
+        if (bc_dirty[i] == b) bc_dirty[i--] = bc_dirty[--nbc_dirty];
+    if (!s) return;
+    views_forget(&s->img);
+    defer((Dead){.img = s->img.image, .mem = s->img.mem});
+    free(s->drawn);
+    free(s);
+    b->bc_shadow = NULL;
+}
+
+// A new shadow holds the texture's blocks before anything is drawn into it: a draw may cover only part of a slice,
+// and the whole slice is decoded. From guest memory (the CPU's blocks; tegra layout as upload_texture reads it), or
+// from the shadow in another format it replaces (`from`: the blocks drawn since, same size).
+static void bc_shadow_fill(NvnTexture *t, TexBackend *b, BcShadow *s, const BcShadow *from) {
+    bool is3d = b->base_type == VK_IMAGE_VIEW_TYPE_3D;
+    uint32_t nlv = s->img.levels;
+    if (from) {
+        VkImageCopy c[16];
+        for (uint32_t lv = 0; lv < nlv; lv++)
+            c[lv] = (VkImageCopy){.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, lv, 0, b->layers},
+                                  .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, lv, 0, b->layers},
+                                  .extent = {bc_blocks(b->width, lv), bc_blocks(b->height, lv), is3d ? level_slices(b, lv) : 1}};
+        VkCommandBuffer cb = vk_cmd();
+        vkCmdCopyImage(cb, from->img.image, VK_IMAGE_LAYOUT_GENERAL, s->img.image, VK_IMAGE_LAYOUT_GENERAL, nlv, c);
+        vk_full_barrier(cb);
+        return;
+    }
+    if (!t->addr) return;
+    VkCommandBuffer cb = vk_upload_cmd();
+    uint32_t layers = t->layout.layers ? t->layout.layers : 1, levels = t->layout.levels < nlv ? t->layout.levels : nlv;
+    if (layers > b->layers) layers = b->layers;
+    uint64_t layer_size = tegra_layer_size(&t->layout);
+    for (uint32_t layer = 0; layer < layers; layer++)
+        for (uint32_t lv = 0; lv < levels; lv++) {
+            LevelLayout l = tegra_level(&t->layout, lv);
+            uint32_t d = is3d ? l.d : 1, row = l.wb * s->bsize;
+            VkSpan sp = vk_transient((uint64_t)row * l.hb * d, 16);
+            const uint8_t *src = (const uint8_t *)(uintptr_t)t->addr + layer * layer_size + l.offset;
+            if (t->flags & 0x50)  // (linear: rows t->stride apart with flag 0x10, packed with 0x40 - upload_texture)
+                for (uint32_t y = 0; y < l.hb * d; y++)
+                    memcpy((uint8_t *)sp.ptr + (uint64_t)y * row, src + (uint64_t)y * ((t->flags & 0x10) ? t->stride : row), row);
+            else tegra_deswizzle(src, sp.ptr, l.wb, l.hb, d, s->bsize, l.block_height_log2, l.block_depth_log2);
+            VkBufferImageCopy r = {.bufferOffset = sp.off, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, lv, layer, 1},
+                                   .imageExtent = {l.wb, l.hb, d}};
+            vkCmdCopyBufferToImage(cb, sp.buf, s->img.image, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+        }
+}
+
+static BcShadow *bc_shadow_create(NvnTexture *t, TexBackend *b, VkFormat vf, uint32_t bsize, BcShadow *from) {
+    bool is3d = b->base_type == VK_IMAGE_VIEW_TYPE_3D;
+    uint32_t nlv = b->levels < 16 ? b->levels : 16, w = 1, h = 1, nslices = 0;
+    BcShadow *s = calloc(1, sizeof *s);
+    if (!s) return NULL;
+    for (uint32_t lv = 0; lv < nlv; lv++) {  // (level 0 wide enough that each level's blocks fit: 20 texels - 5, 3, 2, 1, 1;
+        uint32_t bw = bc_blocks(b->width, lv), bh = bc_blocks(b->height, lv);  // a level of one block fits any: its extent is
+        if (bw > 1 && bw << lv > w) w = bw << lv;                               // at least 1)
+        if (bh > 1 && bh << lv > h) h = bh << lv;
+        s->first[lv] = nslices;
+        nslices += level_slices(b, lv);
+    }
+    {   // (as many levels as the image's largest side allows: that side at least 2^(levels - 1))
+        uint32_t big = w > h ? w : h;
+        if (is3d && b->depth > big) big = b->depth;
+        if (big < 1u << (nlv - 1)) *(w >= h ? &w : &h) = 1u << (nlv - 1);
+    }
+    TexBackend *i = &s->img;
+    i->width = w, i->height = h, i->depth = b->depth, i->layers = b->layers, i->levels = nlv, i->samples = 1;
+    i->format = vf, i->aspect = VK_IMAGE_ASPECT_COLOR_BIT, i->base_type = b->base_type;
+    VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+                            .flags = is3d ? VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT : 0,  // (slices drawn through 2D views)
+                            .imageType = is3d ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D, .format = vf,
+                            .extent = {w, h, b->depth}, .mipLevels = nlv, .arrayLayers = b->layers,
+                            .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+                            .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                     VK_IMAGE_USAGE_TRANSFER_DST_BIT};  // (bc_shadow_fill)
+    VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+    if (!(s->drawn = calloc(nslices, 1)) || vmaCreateImage(g_vk.vma, &ci, &ai, &i->image, &i->mem, NULL) != VK_SUCCESS) {
+        static int nfail;
+        if (nfail++ < 4) LOG("[vk] BC %ux%ux%u drawn into as %d: no shadow image\n", t->width, t->height, t->depth, vf);
+        free(s->drawn);
+        free(s);
+        return NULL;
+    }
+    vk_image_init_layout(vk_upload_cmd(), i->image, VK_IMAGE_ASPECT_COLOR_BIT);
+    s->bsize = bsize;
+    bc_shadow_fill(t, b, s, from);
+    if (from) {  // (replaced: not dirty - vk_bc_shadows_resolve decoded it)
+        views_forget(&from->img);
+        defer((Dead){.img = from->img.image, .mem = from->img.mem});
+        free(from->drawn);
+        free(from);
+    }
+    b->bc_shadow = s;
+    static int nlog;
+    if (nlog++ < 8) LOG("[vk] BC texture %ux%ux%u (nvn %#x) drawn into as %d: blocks decoded after the draws\n",
+                        t->width, t->height, t->depth, t->format, vf);
+    return s;
+}
+
+// The format of the shadow a render target view of t draws into, VK_FORMAT_UNDEFINED when it draws without one
+static VkFormat bc_shadow_format(const NvnTexture *t, const NvnTextureView *v) {
+    const TexBackend *b = t->backend;
+    static int off = -1;  // (LARECOMP_NO_BC_SHADOW=1: none - the draws land in the decoded texels, as before)
+    if (off < 0) off = getenv("LARECOMP_NO_BC_SHADOW") != NULL;
+    if (off || !b || !b->bc_vf || !v || !(v->setmask & 4) || b->samples > 1) return VK_FORMAT_UNDEFINED;
+    const FormatInfo *bf = t->layout.fmt, *vfi = nvn_format_info(v->format);
+    if (!bf || !vfi || bf->bw != 4 || bf->bh != 4 || vfi->bw != 1 || vfi->bh != 1 || vfi->bpb != bf->bpb) return VK_FORMAT_UNDEFINED;
+    uint32_t lv = v->setmask & 1 ? v->base_level : 0;
+    int rt3d = rt3d_mode();
+    if (lv >= b->levels || lv >= 16 || (b->base_type == VK_IMAGE_VIEW_TYPE_3D && (rt3d == 0 || (rt3d == 1 && lv > 0))))
+        return VK_FORMAT_UNDEFINED;  // (LARECOMP_3D_RT: as vk_view)
+    return vk_format(v->format);
+}
+
+VkImageView vk_bc_shadow_view(NvnTexture *t, const NvnTextureView *v, VkFormat *fmt, uint32_t *w, uint32_t *h) {
+    TexBackend *b = t->backend;
+    VkFormat vf = bc_shadow_format(t, v);
+    if (!vf) return VK_NULL_HANDLE;
+    const FormatInfo *bf = t->layout.fmt;
+    uint32_t lv = v->setmask & 1 ? v->base_level : 0, z = v->setmask & 2 ? v->min_layer : 0;
+    BcShadow *s = b->bc_shadow, *from = NULL;
+    if (s && s->img.format != vf) {  // (one drawn into in another format: vk_bc_shadows_resolve decoded it, unless it is
+        if (s->dirty) return VK_NULL_HANDLE;  // a target of this pass too; a new one takes its blocks)
+        from = s, s = NULL;
+    }
+    if (!s && nbc_dirty < (int)(sizeof bc_dirty / sizeof *bc_dirty)) s = bc_shadow_create(t, b, vf, bf->bpb, from);
+    if (!s || (!s->dirty && nbc_dirty == (int)(sizeof bc_dirty / sizeof *bc_dirty))) return VK_NULL_HANDLE;
+    uint32_t n = level_slices(b, lv);
+    if (z >= n) z = n - 1;
+    VkImageView view = vk_image_view(&s->img, VK_IMAGE_VIEW_TYPE_2D, vf, lv, 1, z, 1, IDENTITY, VK_IMAGE_ASPECT_COLOR_BIT);
+    if (!view) return VK_NULL_HANDLE;
+    *fmt = vf;
+    *w = bc_blocks(b->width, lv), *h = bc_blocks(b->height, lv);
+    s->drawn[s->first[lv] + z] = 1;
+    if (!s->dirty) s->dirty = true, bc_dirty[nbc_dirty++] = b;
+    return view;
+}
+
+// The blocks drawn into b's shadow, back on the CPU and decoded into its image
+static void bc_shadow_resolve(TexBackend *b) {
+    BcShadow *s = b->bc_shadow;
+    bool is3d = b->base_type == VK_IMAGE_VIEW_TYPE_3D;
+    uint32_t nlv = s->img.levels, nslices = s->first[nlv - 1] + level_slices(b, nlv - 1), n = 0;
+    VkBufferImageCopy *rg = malloc(nslices * sizeof *rg);
+    if (!rg) {
+        LOG("[vk] BC %ux%ux%u: no memory to decode its shadow\n", b->width, b->height, b->depth);
+        memset(s->drawn, 0, nslices);  // (what was drawn is lost; the shadow stays usable)
+        s->dirty = false;
+        return;
+    }
+    uint64_t total = 0;
+    for (uint32_t lv = 0; lv < nlv; lv++)
+        for (uint32_t z = 0; z < level_slices(b, lv); z++) {
+            if (!s->drawn[s->first[lv] + z]) continue;
+            uint32_t wb = bc_blocks(b->width, lv), hb = bc_blocks(b->height, lv);
+            rg[n++] = (VkBufferImageCopy){.bufferOffset = total, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, lv, is3d ? 0 : z, 1},
+                                          .imageOffset = {0, 0, is3d ? (int32_t)z : 0}, .imageExtent = {wb, hb, 1}};
+            total += (uint64_t)wb * hb * s->bsize;
+        }
+    if (n) {
+        VkSpan rb = vk_readback(total);
+        for (uint32_t i = 0; i < n; i++) rg[i].bufferOffset += rb.off;
+        VkCommandBuffer cb = vk_cmd();
+        vk_full_barrier(cb);
+        vkCmdCopyImageToBuffer(cb, s->img.image, VK_IMAGE_LAYOUT_GENERAL, rb.buf, n, rg);
+        VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                               .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT,
+                               .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT};
+        VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+        vkCmdPipelineBarrier2(cb, &di);
+        uint64_t t0 = SDL_GetTicksNS();
+        renderer_flush();  // (the blocks on the CPU right after)
+        vk_readback_ready(total);
+        uint64_t t1 = SDL_GetTicksNS();
+        cb = vk_cmd();
+        for (uint32_t i = 0; i < n; i++) {
+            const VkBufferImageCopy *r = &rg[i];
+            bc_upload_blocks(cb, b, (const uint8_t *)rb.ptr + (r->bufferOffset - rb.off), r->imageExtent.width,
+                             r->imageExtent.height, s->bsize, r->imageSubresource.mipLevel,
+                             r->imageSubresource.baseArrayLayer, (uint32_t)r->imageOffset.z, NULL);
+        }
+        vk_full_barrier(cb);
+        // (each decode: the GPU waited for - the render thread blocked - and the CPU's decode; the first 8, then every 64th)
+        static uint64_t nres;
+        if (nres++ < 8 || nres % 64 == 0) {
+            uint64_t nonzero = 0, t2 = SDL_GetTicksNS();
+            for (uint64_t i = 0; i < total; i++) nonzero += ((const uint8_t *)rb.ptr)[i] != 0;
+            LOG("[vk] BC %ux%ux%u: decode %llu at frame %llu: %u slices (%llu of %llu bytes nonzero), GPU wait %.2f ms, decode %.2f ms\n",
+                b->width, b->height, b->depth, (unsigned long long)nres, (unsigned long long)vk_frame_counter(), n,
+                (unsigned long long)nonzero, (unsigned long long)total, (t1 - t0) / 1e6, (t2 - t1) / 1e6);
+        }
+    }
+    free(rg);
+    memset(s->drawn, 0, nslices);
+    s->dirty = false;
+}
+
+void vk_bc_shadows_resolve(NvnTexture *const *targets, const NvnTextureView *views, const uint8_t *has_view, int ntargets) {
+    for (int k = 0; k < nbc_dirty; k++) {
+        TexBackend *b = bc_dirty[k];
+        bool drawn = false;  // (still being drawn into: the next pass's target, through a view in the shadow's format -
+                             // another one replaces the shadow, vk_bc_shadow_view)
+        for (int i = 0; i < ntargets; i++)
+            drawn |= targets[i] && targets[i]->backend == b && has_view[i] &&
+                     bc_shadow_format(targets[i], &views[i]) == b->bc_shadow->img.format;
+        if (drawn) continue;
+        bc_shadow_resolve(b);
+        bc_dirty[k--] = bc_dirty[--nbc_dirty];
+    }
+}
+#endif
+
+// A texture first drawn into at a level past 0, its mips made from the level the CPU filled: that level uploaded
+// before the texture becomes the GPU's. BOTW fills its 32x32x32 noise volume on the CPU and draws the mips from it (then
+// compresses it to BC4); never uploaded, it stayed zero - the fast-travel dissolve without its noise.
+void vk_tex_upload_for_mips(NvnTexture *t) {
+    TexBackend *b = t->backend;
+    if (b && (b->gpu_owned || b->uploaded)) return;
+    static int nlog;
+    if (nlog++ < 8) LOG("[vk] %ux%ux%u (nvn %#x) first drawn into at a level past 0: its CPU contents uploaded first\n",
+                        t->width, t->height, t->depth, t->format);
+    vk_tex(t, false);
 }
 
 // 1x1 black textures for unbound slots, per type
@@ -1484,6 +1804,36 @@ VkSampler vk_sampler_point(NvnSamplerDesc *d) {
     int i = n < 256 ? n++ : next++ % 256;
     tab[i].from = s; tab[i].point = q;
     return q;
+}
+
+// A format the GPU can't filter linearly (no SAMPLED_IMAGE_FILTER_LINEAR): undefined through a linear sampler. Mali's
+// drivers list R16G16B16A16_UNORM so - BOTW's grass reads one in its vertex shader, and an older driver returned
+// garbage: the grass stretched and black (#307 Immortalis-G715, #258 G68; #244, Propinbo). Those take the sampler's
+// nearest twin instead (exec.c). LARECOMP_NO_FILTER_FALLBACK=1: as before.
+bool vk_format_filters_linear(VkFormat f) {
+    static struct { VkFormat f; bool ok; } cache[64];
+    static int n;
+    for (int i = 0; i < n; i++) if (cache[i].f == f) return cache[i].ok;
+    bool ok = format_supports(f, VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) || getenv("LARECOMP_NO_FILTER_FALLBACK");
+    if (!ok) LOG("[vk] format %d can't be filtered linearly on this GPU: its textures sampled nearest\n", f);
+    if (n < 64) cache[n].f = f, cache[n].ok = ok, n++;
+    return ok;
+}
+
+VkSampler vk_sampler_nearest(NvnSamplerDesc *d, bool compare) {
+    // Pool descriptors can be rewritten at the same address: cache their values, not their pointers.
+    static struct { NvnSamplerDesc d; bool compare; VkSampler s; } tab[256];
+    static int n, next;
+    NvnSamplerDesc point = *d;
+    point.mag_filter = 0;
+    point.min_filter = point.min_filter <= 1 ? 0 : 2;
+    point.max_aniso = 1;
+    for (int i = 0; i < n; i++)
+        if (tab[i].compare == compare && !memcmp(&tab[i].d, &point, sizeof point)) return tab[i].s;
+    VkSampler s = make_sampler(&point, compare);
+    int i = n < 256 ? n++ : next++ % 256;
+    tab[i].d = point; tab[i].compare = compare; tab[i].s = s;
+    return s;
 }
 
 static VkSampler make_sampler(const NvnSamplerDesc *d, bool compare) {

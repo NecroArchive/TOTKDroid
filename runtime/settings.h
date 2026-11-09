@@ -35,11 +35,13 @@ typedef struct {
     bool movie_audio;
     bool show_fps;
     bool motion;          // the phone's (or a controller's) gyroscope as the controller's motion sensor (hle/motion.c)
+    int motion_source;    // whose: 0 automatic (a controller's once its gyroscope is alive), 1 the phone's, 2 a controller's
+    bool motion_flat;     // the phone's sensors as the Switch's screen in handheld mode, not a flat controller (hle/motion.c)
 #ifdef __ANDROID__
     bool touch_controls;  // on-screen controls while no controller is connected (ui/touch_controls.mm)
     int overlay_style;    // Show FPS's overlay (ui/perf_overlay.mm): 0 full, 1 compact (one line)
     float overlay_pos[2]; // its top left, a share of the screen, dragged there with a finger (negative: the corner)
-    int fps_mode;         // 0: the game's own choice (30 / 60, the frame pacer), 1: 30 fps, 2: 60 fps
+    int fps_mode;         // 0 Auto, 1 30 fps, 2 60 fps, 3 20 fps, 4 40/45 fps (display dependent)
     bool shader_int32;    // shader address math in 32-bit words even where the driver offers 64-bit (vulkan/exec.c)
     bool files_in_place;  // Android: a setup reads the picked romfs/ where it is, no copy (services/fs.c); off by default
     bool native_code;     // Android: the game's own code on the CPU, no build of it (runtime/native.c); off by default
@@ -49,12 +51,25 @@ typedef struct {
     // (turnip_lrz, log_file). -1 Automatic: on for the Adreno 8xx GPUs these paths were made on, off elsewhere
     // (vulkan/device.c vk_adreno_8xx); 1 on, 0 off.
     int gpu_heap;         // Turnip: the game's memory mapped as GPU memory (vulkan/exec.c vk_heap_place); off: CPU copies
+    bool heap_file;       // the game's memory as GPU memory through an exported file mapped at its address, where the driver
+                          // can't place it (Mali, Xclipse; experimental): vulkan/exec.c vk_heap_place, at the game's start
     int inplace_reads;    // Turnip: draws sample targets they write as they are (vulkan/exec.c resolve_feedback); off: copies
     int turnip_lrz;       // Turnip's low-resolution Z; off: TU_DEBUG=nolrz before the driver loads (vulkan/device.c)
     bool log_file;        // the log in a file as well (platform/android.c), to send with a report
     char gpu_model[64];   // the GPU of the last start ("Adreno (TM) 830v1"): turnip_lrz's Automatic, before the driver
+    char driver_env[256]; // the driver's own switches, NAME=value separated by spaces (Turnip's FD_DEV_FEATURES, TU_DEBUG;
+                          // #227): set when the app starts, before the driver loads (vulkan/device.c)
 #define TOUCH_NCTL 19  // (ui/touch_controls.mm: LAS's 12, then the right stick, L3 / R3 and the d-pad)
     float touch_pos[TOUCH_NCTL][2];  // each on-screen control's place, a share of the screen (negative: default)
+    // The icon layout (ui/touch_controls.mm), in the world only - the classic one above stays in the game's menus:
+    // touch_scheme 1 (0: the classic one everywhere), its controls' places of their own
+#define TOUCH_NCTL2 22
+    int touch_scheme;
+    float touch_pos2[TOUCH_NCTL2][2];
+    float touch_size[TOUCH_NCTL], touch_size2[TOUCH_NCTL2];  // each control's own size (times touch_scale; 0: 1)
+    float touch_aim_sens;  // the icon layout's bow / throw drag: how fast it turns the aim (1: the default)
+    bool touch_minimap_top;  // the minimap group up at the top while the touch controls are up (#254: off keeps it in place)
+    bool touch_talk;       // the icon layout gives way to a talk: only the stick, A and B (false: all its controls stay)
     float touch_scale, touch_opacity;
     // FPS-style touch play (ui/touch_controls.mm): the camera by dragging a finger (its speed tilts the right stick)
     // instead of holding a stick, at touch_drag_sens; the sticks drawn only while a finger holds them; each stick's

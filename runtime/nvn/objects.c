@@ -1623,7 +1623,7 @@ NVN(nvnWindowGetPresentInterval) { RET(WIN->interval); }
 bool rt_fps60(void) {
     static int env = -2;
     if (env == -2) env = getenv("LARECOMP_FPS60") ? atoi(getenv("LARECOMP_FPS60")) : -1;
-    return env >= 0 ? env != 0 : g_game_version == GAME_V_143 && g_settings.fps_mode != 1;
+    return env >= 0 ? env != 0 : g_game_version == GAME_V_143 && g_settings.fps_mode != 1 && g_settings.fps_mode != 3;
 }
 
 // TOTK cutscenes: some of their timing counts frames, so above 30 fps they played fast. tools/patches.py marks the
@@ -1725,6 +1725,10 @@ static void totk_auto_present(uint64_t now) {
 
 int64_t rt_frame_ticks(int64_t ticks) {
     if (!g_settings.fps_mode) return ticks;
+    if (g_settings.fps_mode == 4) {
+        const int64_t cap = 19200000ll * 90 / 100 / 60;
+        return ticks > cap ? cap : ticks;
+    }
     const int64_t cap = 19200000ll * 185 / 100 / 60;  // (1.85 vsyncs)
     return ticks > cap ? cap : ticks;
 }
@@ -1860,9 +1864,10 @@ NVN(nvnWindowSetPresentInterval) {
     // TOTK at Frame rate 60: always 1. Its controller (rt_fps60) went back to 2 within a second each time it tried 1
     // in the cave (2026-10-29: 6 tries in 200 s, 30.8 fps on average); held at 1 the same walk ran 35 fps there (GPU
     // and the ~18 ms render thread: 42 at a 960x540 scene) - Auto leaves the choice to the game.
-    if (g_game_version == GAME_V_143 && (g_settings.fps_mode == 2 || rt_totk_auto60()) && rt_fps60() && force <= 0 &&
+    if (g_game_version == GAME_V_143 && (g_settings.fps_mode == 2 || g_settings.fps_mode == 4 || rt_totk_auto60()) && rt_fps60() && force <= 0 &&
         !rt_cutscene())
         c->x[1] = 1;
+    if (g_game_version == GAME_V_143 && g_settings.fps_mode == 3 && force <= 0) c->x[1] = 3;
     if ((int)A(1) != g_present_interval)
         LOG("[pace] the game sets its present interval to %d (lr %llx, x19 %llx [+0x240] %lld)\n", (int)A(1),
             (unsigned long long)c->x[30], (unsigned long long)c->x[19],
@@ -1912,7 +1917,8 @@ NVN(nvnQueuePresentTexture) {
         int n = w->interval > cap ? w->interval : cap;
         // (TOTK at Frame rate 60: 1 whatever the window kept - the controller calls it only on a change, and a
         // cutscene's 2 stayed there after it; a cutscene at 30, as on the Switch)
-        if (g_game_version == GAME_V_143 && g_settings.fps_mode == 2 && rt_fps60()) n = 1;
+        if (g_game_version == GAME_V_143 && (g_settings.fps_mode == 2 || g_settings.fps_mode == 4) && rt_fps60()) n = 1;
+        if (g_game_version == GAME_V_143 && g_settings.fps_mode == 3) n = 3;
         if (rt_totk_auto()) {  // (Auto: rt_totk_auto60's pick)
             totk_auto_present(plat_now_ns());
             n = totk_auto60 ? 1 : 2;
@@ -1945,6 +1951,22 @@ NVN(nvnQueuePresentTexture) {
             g_present_vsync_wait_ns = plat_now_ns() - t0;
             g_blocked_ns += plat_now_ns() - t0;
             last_vs = __atomic_load_n(&g_vsync_count, __ATOMIC_RELAXED);
+        }
+    }
+    if (g_game_version == GAME_V_143) {
+        // Intermediate cap keeps the game's 60-fps path, paced at 40/45 (or 30 on a 60-Hz display).
+        static uint64_t previous;
+        static int mode = -1;
+        if (mode != g_settings.fps_mode) previous = 0, mode = g_settings.fps_mode;
+        if (mode == 4) {
+            extern int vk_between_fps(void);
+            extern __thread uint64_t g_blocked_ns;
+            uint64_t now = plat_now_ns(), period = 1000000000ull / (rt_cutscene() ? 30 : vk_between_fps());
+            if (previous && now < previous + period) {
+                plat_sleep_until_ns(previous + period);
+                g_blocked_ns += plat_now_ns() - now;
+            }
+            previous = plat_now_ns();
         }
     }
     frame_step_update(plat_now_ns());  // (TOTK 1.4.3's world step: the time between presents)

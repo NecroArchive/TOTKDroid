@@ -145,6 +145,54 @@ bool widescreen_in_menu(void) {
     return last && now < last + 30;
 }
 
+// The minimap's disc (vulkan/exec.c: its pane's shader) was drawn this frame or in the last few: the minimap is on screen.
+static uint64_t minimap_frame;
+void widescreen_minimap_seen(void) {
+    extern uint64_t renderer_present_count(void);
+    minimap_frame = renderer_present_count();
+}
+static bool minimap_on(void) {
+    extern uint64_t renderer_present_count(void);
+    return minimap_frame && renderer_present_count() - minimap_frame <= 3;
+}
+
+// Playing in the world: not the title or a loading screen, no menu of the game's up (pause, map) - the touch controls'
+// icon layout (ui/touch_controls.mm); the classic one stays in the menus. TOTK's menus aren't told apart from the world
+// by the game's state (framepace_in_menu is 1.8.2's): its HUD is the sign - the minimap on screen, which the inventory,
+// the map, the loading screens and the events hide. (Until exec.c knows its pane: the 3D scene drawn a moment ago.)
+bool widescreen_world_play(void) {
+    extern bool vk_minimap_known(void);
+    if (!in_world() || widescreen_in_menu()) return false;
+    return g_game_version != GAME_V_143 || !vk_minimap_known() || minimap_on();
+}
+
+// A talk's box (vulkan/exec.c: its pane) was drawn this frame or in the last few
+static uint64_t talk_frame;
+void widescreen_talk_seen(void) {
+    extern uint64_t renderer_present_count(void);
+    talk_frame = renderer_present_count();
+}
+
+// The minimap group up at the top right while the on-screen controls are up (ui/touch_controls.mm touch_hud_top: their
+// buttons sat over it) and the player is in the world with the minimap on screen: a pane of the HUD's layout in its lower
+// right (TOTK's 1920x1080 units, y up: x > HUD_TOP_X, y < HUD_TOP_Y - the minimap, its coordinates, the clock, the
+// weather, the temperature and noise gauges: 488..910, -219..-521, 2026-11-03) goes up this many layout units, its top near
+// the screen's; 0 elsewhere. vulkan/exec.c moves those panes, their texts and scissors.
+#define HUD_TOP_X 430.0f
+#define HUD_TOP_Y (-210.0f)
+#define HUD_TOP_DY 740.0f
+float widescreen_hud_top(float x, float y) {
+    extern bool touch_hud_top(void);
+    if (x < HUD_TOP_X || y > HUD_TOP_Y || !touch_hud_top() || !widescreen_world_play() || !minimap_on()) return 0;
+    return HUD_TOP_DY;
+}
+
+// A talk's box is on screen (in the world): the touch controls give way to it (ui/touch_controls.mm)
+bool widescreen_talk(void) {
+    extern uint64_t renderer_present_count(void);
+    return talk_frame && renderer_present_count() - talk_frame <= 3 && widescreen_world_play();
+}
+
 float widescreen_hud_shift(float x) {
     // (TOTK: its menus aren't told apart from the world yet - framepace_in_menu is 1.8.2's - so the HUD stays in the
     // middle 16:9 part there, where the inventory's grids keep together; LARECOMP_TOTK_HUD_EDGES=1 tries the edges)

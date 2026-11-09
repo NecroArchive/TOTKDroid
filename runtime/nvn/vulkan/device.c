@@ -459,6 +459,7 @@ static void create_device(void) {
     VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT divisor_have = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT};
     VkPhysicalDeviceFaultFeaturesEXT fault_have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
+    VkPhysicalDeviceMaintenance5FeaturesKHR maintenance5_have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR};
     VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR executable_have = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR};
     VkPhysicalDeviceFeatures2 optional = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
@@ -467,6 +468,7 @@ static void create_device(void) {
     QUERY_OPTIONAL(VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME, border_have);
     QUERY_OPTIONAL(VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME, divisor_have);
     QUERY_OPTIONAL(VK_EXT_DEVICE_FAULT_EXTENSION_NAME, fault_have);
+    QUERY_OPTIONAL(VK_KHR_MAINTENANCE_5_EXTENSION_NAME, maintenance5_have);
     QUERY_OPTIONAL(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME, executable_have);
 #undef QUERY_OPTIONAL
     vkGetPhysicalDeviceFeatures2(g_vk.phys, &optional);
@@ -506,6 +508,13 @@ static void create_device(void) {
     }
 #endif
     if (g_vk.divisor) ext[n_ext++] = VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME;
+#ifdef __ANDROID__
+    // BOTW draws points (one draw a frame) from a vertex shader that writes no PointSize: their size is undefined without
+    // maintenance5, and 1 with it. Mali-G925 draws 1 pixel either way (measured). LARECOMP_NO_MAINTENANCE5=1: not asked for.
+    bool maintenance5 = maintenance5_have.maintenance5 && (g_vk.api >= VK_API_VERSION_1_3 || cg[OPT_DR]) &&
+                        !env_on("LARECOMP_NO_MAINTENANCE5");
+    if (maintenance5) ext[n_ext++] = VK_KHR_MAINTENANCE_5_EXTENSION_NAME;
+#endif
     g_vk.host_import = has_ext(ep, ne, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);  // guest heap as a GPU buffer (exec.c)
 #ifdef __ANDROID__
     // Mali-G2-Ultra (Xring O3, driver r56p0): with the import and the global-memory arena (exec.c gres_init) the game's
@@ -540,6 +549,22 @@ static void create_device(void) {
     g_vk.exec_stats = getenv("LARECOMP_SHADER_STATS") &&
                       has_ext(ep, ne, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME) && executable_have.pipelineExecutableInfo;
     if (g_vk.exec_stats) ext[n_ext++] = VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME;
+    // ... or by exporting device memory as a file (a dma-buf) and mapping that at the heap's address ourselves: the same
+    // result on drivers without placed maps or the host import (Mali, Xclipse; exec.c vk_heap_place - BOTWRecompAndroid
+    // ed53b68, after legendszaonandroid's VULKAN_BACKEND.md, MIT)
+    g_vk.mem_fd = has_ext(ep, ne, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME) &&
+                  (g_vk.api >= VK_API_VERSION_1_1 || has_ext(ep, ne, VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME));
+    if (g_vk.mem_fd) ext[n_ext++] = VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME;
+    // (a dma-buf, the other file type: where the opaque one takes no memory the CPU can use - Xclipse 530, #234)
+    g_vk.mem_dmabuf = g_vk.mem_fd && has_ext(ep, ne, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
+    if (g_vk.mem_dmabuf) ext[n_ext++] = VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME;
+    // (which ways this driver could export memory at all: a report from a Mali or an Xclipse says what to try next -
+    // the option did nothing on a Mali-G720 r49p1 with no word in the log, #249)
+    LOG("[vk-cap] memory export: fd %s, dma-buf %s, Android hardware buffer %s, placed maps %s, host import %s\n",
+        g_vk.mem_fd ? "yes" : "no", has_ext(ep, ne, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME) ? "yes" : "no",
+        has_ext(ep, ne, VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME) ? "yes" : "no",
+        has_ext(ep, ne, VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME) ? "yes" : "no",
+        has_ext(ep, ne, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME) ? "yes" : "no");
     // the guest heap as GPU memory mapped at its own address (exec.c vk_heap_place; Turnip has it)
     g_vk.map_placed = has_ext(ep, ne, VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME) && has_ext(ep, ne, VK_KHR_MAP_MEMORY_2_EXTENSION_NAME);
     if (g_vk.map_placed) {
@@ -793,6 +818,8 @@ static void create_device(void) {
             n_ext -= 2;  // (the two map extensions were the last added)
         }
     }
+    VkPhysicalDeviceMaintenance5FeaturesKHR m5 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR, .maintenance5 = VK_TRUE};
+    if (maintenance5) { m5.pNext = f.pNext; f.pNext = &m5; LOG("[vk-cap] maintenance5 on\n"); }
     VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR pex = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR, .pipelineExecutableInfo = VK_TRUE};
     if (g_vk.exec_stats) { pex.pNext = f.pNext; f.pNext = &pex; }
@@ -816,6 +843,11 @@ static void create_device(void) {
     ai.vulkanApiVersion = g_vk.api;
     VmaVulkanFunctions vf = {.vkGetInstanceProcAddr = vkGetInstanceProcAddr, .vkGetDeviceProcAddr = vkGetDeviceProcAddr};
     ai.pVulkanFunctions = &vf;  // (VMA_DYNAMIC_VULKAN_FUNCTIONS: from the driver volk loaded)
+    {   // Low RAM (exec.c vk_low_ram): 32 MB blocks, not VMA's 256 MB - a block taken whole for a few textures (the GPU
+        // memory went from 96 to 480 MB at once on a 4 GB tablet's title screen)
+        extern bool vk_low_ram(void);
+        if (vk_low_ram()) ai.preferredLargeHeapBlockSize = 32ull << 20;
+    }
 #endif
     VK_CHECK(vmaCreateAllocator(&ai, &g_vk.vma));
 
@@ -1291,6 +1323,9 @@ void backend_present(NvnTexture *t) {
     TexBackend *b = vk_tex(t, true);
     b->presented = true;
     vk_end_pass();
+#ifdef __ANDROID__
+    vk_bc_shadows_resolve(NULL, NULL, NULL, 0);  // (BC textures drawn into: decoded, as before anything outside a pass)
+#endif
     static const float black[4] = {0, 0, 0, 1};
     uint64_t t0 = SDL_GetTicksNS();
     bool have = vk_frame_begin(black);
@@ -1718,8 +1753,25 @@ bool vk_adreno_8xx(const char *name) {
 }
 // A Turnip path's setting (-1 Automatic, 1 on, 0 off) for this GPU
 bool vk_turnip_path_on(int setting) { return setting < 0 ? vk_adreno_8xx(g_vk.props.deviceName) : setting != 0; }
+int vk_between_fps(void) {
+    static int fps = 45;
+    static uint64_t next;
+    uint64_t now = SDL_GetTicksNS();
+    if (now >= next) {
+        next = now + 1000000000ull;
+        const SDL_DisplayMode *m = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(window));
+        float hz = m ? m->refresh_rate : 0;
+        int f = hz > 110 ? 40 : hz > 80 ? 45 : hz > 50 ? 30 : 45;
+        if (f != fps) LOG("[vk] Frame rate 40 / 45: %d fps on a %.0f Hz screen\n", f, hz);
+        fps = f;
+    }
+    return fps;
+}
+
 static bool g_lrz_at_start = true;
 bool vk_lrz_at_start(void) { return g_lrz_at_start; }  // (the start screen: a change needs a restart)
+static char g_driver_env_at_start[256];  // (the same for the driver's switches, g_settings.driver_env)
+const char *vk_driver_env_at_start(void) { return g_driver_env_at_start; }
 const char *vk_gpu_name(void) { return g_vk.props.deviceName; }
 #endif
 
@@ -1735,12 +1787,26 @@ void ui_window_init(void) {
     {   // Driver compatibility (the start screen's Settings > Prelaunch): applied before the driver loads
         extern void android_log_file(bool on);
         android_log_file(g_settings.log_file);
+        {   // The driver's own switches from the settings (#227: Samsung phones under Turnip want
+            // FD_DEV_FEATURES=enable_tp_ubwc_flag_hint=1): NAME=value pairs separated by spaces, each up to the next space;
+            // a TU_DEBUG given there wins over LRZ's below
+            char buf[sizeof g_settings.driver_env], *save = NULL;
+            snprintf(buf, sizeof buf, "%s", g_settings.driver_env);
+            snprintf(g_driver_env_at_start, sizeof g_driver_env_at_start, "%s", g_settings.driver_env);
+            for (char *p = strtok_r(buf, " \t;", &save); p; p = strtok_r(NULL, " \t;", &save)) {
+                char *eq = strchr(p, '=');
+                if (!eq || eq == p) continue;
+                *eq = 0;
+                setenv(p, eq + 1, 1);
+                LOG("[vk] driver setting from the settings: %s=%s\n", p, eq + 1);
+            }
+        }
         // Turnip reads TU_DEBUG once, when it starts: low-resolution Z off (it can drop draws on some Adreno GPUs).
         // Automatic needs the GPU before Vulkan names it: the kernel's (the GPU driver reads it from the app too), else
         // the last start's; unknown: on.
         int lrz = g_settings.turnip_lrz;
         char model[64] = "";
-        if (lrz < 0) {
+        {
             FILE *f = fopen("/sys/class/kgsl/kgsl-3d0/gpu_model", "r");
             if (f) {
                 if (!fgets(model, sizeof model, f)) model[0] = 0;
@@ -1748,7 +1814,21 @@ void ui_window_init(void) {
                 model[strcspn(model, "\r\n")] = 0;
             }
             if (!model[0]) snprintf(model, sizeof model, "%s", g_settings.gpu_model);
-            lrz = !model[0] || vk_adreno_8xx(model);
+        }
+        if (lrz < 0) lrz = !model[0] || vk_adreno_8xx(model);
+        {   // #32: on the Adreno 840 and up (Mesa's a8xx, the Turnip Gen8 drivers from V30), shadowed ground turns red -
+            // ir3 moving a shader's uniform buffer into its constants reads a draw's constants stale. With that off: no
+            // tint and the same ~40 fps (a Z Fold 8). An IR3_SHADER_DEBUG from the driver variables wins.
+            const char *a = strstr(model, "Adreno");
+            int n = 0;
+            if (a) {
+                while (*a && (*a < '0' || *a > '9')) a++;
+                n = atoi(a);
+            }
+            if (n >= 840 && n < 900 && !getenv("IR3_SHADER_DEBUG")) {
+                setenv("IR3_SHADER_DEBUG", "nouboopt", 1);
+                LOG("[vk] %s: IR3_SHADER_DEBUG=nouboopt (shadows drawn red, #32)\n", model);
+            }
         }
         g_lrz_at_start = lrz != 0;
         if (!lrz && !getenv("TU_DEBUG")) setenv("TU_DEBUG", "nolrz", 1);

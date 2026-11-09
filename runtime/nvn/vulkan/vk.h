@@ -57,6 +57,8 @@ typedef struct {
     bool eds2;                    // extended dynamic state 2 in use; without it, depth bias and primitive restart are
                                   // pipeline state (exec.c PipeKey.prim_restart)
 #ifdef __ANDROID__
+    bool mem_dmabuf;              // external memory may be exported as DMA-BUF instead of OPAQUE_FD
+    bool mem_fd;                  // VK_KHR_external_memory_fd: the same through an exported file mapped there (vk_heap_place)
     bool map_placed;              // VK_EXT_map_memory_placed: the guest heap mapped as GPU memory (exec.c vk_heap_place)
     uint64_t placed_align;
     bool bda;                     // bufferDeviceAddress on: the placed heap can be reached by pointer (exec.c gmem_bda)
@@ -114,6 +116,7 @@ typedef struct TexBackend {
     VkImageAspectFlags aspect;
     bool gpu_owned, uploaded, dynamic;
     uint64_t data_hash, sample_hash, checked_frame, full_frame;
+    uint8_t skip;                 // first guest mip retained on low-RAM devices
     uint32_t wgen;  // page write tracking generation at the last upload check (textures.c)
     uint16_t same_run;    // (a large dynamic texture: full hashes in a row that found it unchanged - textures.c)
     uint64_t dyn_sample;  // (and its sampled hash at the last full one)
@@ -129,7 +132,8 @@ typedef struct TexBackend {
     uint8_t astc_bw, astc_bh;  // ASTC without GPU support: decoded to RGBA8 on upload (runtime/nvn/astc.c)
     bool astc_srgb;
     VkFormat bc_vf;  // (Android) a BC format the GPU lacks (Mali): decoded on upload into b->format (textures.c)
-    int tp;              // runtime/nvn/texpatch.c: 0 not checked yet, -1 none, else known UI texture + 1
+    struct BcShadow *bc_shadow;  // (bc_vf) drawn into through a view of the block's size: the blocks (textures.c)
+    int tp;             // runtime/nvn/texpatch.c: 0 not checked yet, -1 none, else known UI texture + 1
     uint32_t tp_gen;     // texpatch_generation() it was last uploaded with
     int reg;  // slot in textures.c's live list + 1 (a reboot destroys them all)
     VkFormat fmt_twin;  // (Android) a format-listed render target (textures.c, UBWC): the one other view format allowed
@@ -138,6 +142,7 @@ typedef struct TexBackend {
 
 VkFormat vk_view_format(NvnTexture *t, VkFormat vf);  // the format a view asking for vf gets (textures.c)
 TexBackend *vk_tex(NvnTexture *t, bool for_render);  // backend image (uploads CPU contents unless for_render)
+void vk_tex_upload_for_mips(NvnTexture *t);  // (drawn into at a level past 0: the CPU's contents first, if never uploaded)
 VkFormat vk_format(uint32_t nvn_format);
 bool vk_format_alpha_one(uint32_t nvn_format);
 bool renderer_texture_scalable(NvnTexture *t);
@@ -150,6 +155,14 @@ VkImageView vk_view(NvnTexture *t, const NvnTextureView *v, bool has_view, bool 
 VkImageView vk_image_view(TexBackend *b, VkImageViewType type, VkFormat fmt, uint32_t lv0, uint32_t nlv, uint32_t ly0,
                           uint32_t nly, VkComponentMapping sw, VkImageAspectFlags aspect);
 VkImageView vk_dummy_view(int textype);
+#ifdef __ANDROID__
+// A render target view of a CPU-decoded BC texture in a format of the block's size (GPU compression): a view of its
+// shadow image (*fmt, *w x *h: that format and level extent), else VK_NULL_HANDLE. vk_bc_shadows_resolve: the blocks
+// drawn decoded into the textures, but those the next pass draws into in their shadow's format (targets through
+// views[i] when has_view[i]; outside any pass, before anything reads them; waits for the GPU).
+VkImageView vk_bc_shadow_view(NvnTexture *t, const NvnTextureView *v, VkFormat *fmt, uint32_t *w, uint32_t *h);
+void vk_bc_shadows_resolve(NvnTexture *const *targets, const NvnTextureView *views, const uint8_t *has_view, int ntargets);
+#endif
 VkSampler vk_sampler(NvnSamplerDesc *d);
 VkSampler vk_sampler_plain(NvnSamplerDesc *d);  // (the same without depth comparison: for non-shadow lookups)
 VkSampler vk_default_sampler(bool linear);
