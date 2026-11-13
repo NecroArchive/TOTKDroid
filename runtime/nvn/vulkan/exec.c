@@ -2871,8 +2871,9 @@ static void translate_program(void *arg) {
         // (and their vertex shaders') to build/fs_<hash>.glsl (LARECOMP_DEBUG_DIR's folder if set), to look at
         const char *want = getenv("LARECOMP_DUMP_FS");
         uint64_t h = hmix(1469598103934665603ull, (const void *)(uintptr_t)(p->code[1] + 0x30), 0x200);
-        bool match = false;
-        for (const char *e = want; e && *e && !match;) {
+        // (=txd: every one with a TXD - textureGrad - in it)
+        bool match = want && !strcmp(want, "txd") && strstr(p->fi->msl, "textureGrad");
+        for (const char *e = want; e && *e && !match && strcmp(want, "txd");) {
             char *end;
             match = strtoull(e, &end, 16) == h;
             if (*end != ',') break;
@@ -7696,6 +7697,36 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
                 if (fp) { fwrite((const void *)(uintptr_t)st.vbuf[sn].addr, 1, st.vbuf[sn].size, fp); fclose(fp); }
             }
             LOG("[draw]   (vertex streams dumped as draw %d)\n", ndraw);
+            if (indexed) {  // (and the indices: <dir>/ib_<fs>_<frame>_<n>.bin - a shader that builds its vertices from the index)
+                uint32_t isz = r->x[1] == 0 ? 1 : r->x[1] == 1 ? 2 : 4;
+                char path[1100];
+                snprintf(path, sizeof path, "%s/ib_%016llx_%llu_%d.bin", dir, (unsigned long long)g_cur_fs_hash,
+                         (unsigned long long)renderer_present_count(), ndraw);
+                FILE *fp = fopen(path, "wb");
+                if (fp) { fwrite((const void *)(uintptr_t)r->x[3], 1, (size_t)r->x[2] * isz, fp); fclose(fp); }
+                LOG("[draw]   (indices: %u bytes each, base vertex %d, base instance %u)\n", isz, (int32_t)r->x[4], (uint32_t)r->x[5]);
+            }
+            // LARECOMP_DUMP_CBUF_PTR=<cbuf>:<hex size>: the game memory a 64-bit pointer at the start of that vertex-stage
+            // constant buffer points at (TOTK's terrain reads its patch tables through one), <dir>/gm_<address>.bin - each
+            // address once
+            const char *pe = getenv("LARECOMP_DUMP_CBUF_PTR");
+            unsigned pk = 0, psize = 0;
+            if (pe && sscanf(pe, "%u:%x", &pk, &psize) == 2 && pk >= 3 && pk < 21 && st.ubuf[0][pk - 3].addr && psize) {
+                static uint64_t done[8];
+                static int ndone;
+                uint64_t p;
+                memcpy(&p, (const void *)(uintptr_t)st.ubuf[0][pk - 3].addr, 8);
+                bool seen = false;
+                for (int i = 0; i < ndone; i++) seen |= done[i] == p;
+                if (!seen && ndone < 8 && p >= 0x340000000ull && p + psize <= 0x410000000ull) {
+                    done[ndone++] = p;
+                    char path[1100];
+                    snprintf(path, sizeof path, "%s/gm_%llx.bin", dir, (unsigned long long)p);
+                    FILE *fp = fopen(path, "wb");
+                    if (fp) { fwrite((const void *)(uintptr_t)p, 1, psize, fp); fclose(fp); }
+                    LOG("[draw]   (game memory %llx + %#x dumped)\n", (unsigned long long)p, psize);
+                }
+            }
             ndraw++;
         }
     }

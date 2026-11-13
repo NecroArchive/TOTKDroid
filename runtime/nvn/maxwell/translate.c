@@ -1002,12 +1002,58 @@ static void emit_txd(Ctx *c, uint64_t w) {
     else if (!array) snprintf(P, sizeof P, "vec2(as_type<float>(r%d), as_type<float>(r%d))", a, a + 1);
     else snprintf(P, sizeof P, "vec3(as_type<float>(r%d), as_type<float>(r%d), float(min(r%d & 0xffffu, uint(tsize%d(0).z) - 1u)))",
                   a, a + 1, a + 2, slot);
+    // (tests: LARECOMP_TXD_ORDER=1 the derivatives as du/dx, dv/dx, du/dy, dv/dy instead; LARECOMP_NO_TXD=1 untranslated,
+    // the draws skipped as before 14e824e - the Depths' ceiling drew as streaks, #37 #52)
+    static int order = -1, off = -1;
+    if (order < 0) order = getenv("LARECOMP_TXD_ORDER") ? atoi(getenv("LARECOMP_TXD_ORDER")) : 0;
+    if (off < 0) off = getenv("LARECOMP_NO_TXD") != NULL;
+    if (off) { fail(c, "TXD (LARECOMP_NO_TXD)"); return; }
     if (n == 1) { snprintf(dx, sizeof dx, "as_type<float>(r%d)", b); snprintf(dy, sizeof dy, "as_type<float>(r%d)", b + 1); }
-    else {
+    else if (order == 1) {
+        snprintf(dx, sizeof dx, "vec2(as_type<float>(r%d), as_type<float>(r%d))", b, b + 1);
+        snprintf(dy, sizeof dy, "vec2(as_type<float>(r%d), as_type<float>(r%d))", b + 2, b + 3);
+    } else {
         snprintf(dx, sizeof dx, "vec2(as_type<float>(r%d), as_type<float>(r%d))", b, b + 2);
         snprintf(dy, sizeof dy, "vec2(as_type<float>(r%d), as_type<float>(r%d))", b + 1, b + 3);
     }
     snprintf(call, sizeof call, "textureGrad(t%d, %s, %s, %s)", slot, P, dx, dy);
+    write_tex_result(c, slot, call, mask, d, RZ, false, false);
+}
+
+// TLD (0xdc38, full-form texel fetch): the type in bits 28-30 (1D, 1D array, 2D, 2D array, 3D), the mask in 31-34;
+// coordinates from gpr8 - an array's layer first (its low 16 bits), then x, y, z; from gpr20 in order the level (bit 55,
+// else level 0), the offsets (bit 35: 4-bit signed x, y, z) and the sample (bit 50, multisample: not here). Layout from
+// yuzu's TranslatorVisitor::TLD and Ryujinx's InstTld; the code is ours. Untranslated, a TOTK Depths fragment shader
+// failed and its draws were skipped (2026-11-13, #37 #52).
+static void emit_tld(Ctx *c, uint64_t w) {
+    int d = (int)bits(w, 0, 8), a = (int)bits(w, 8, 8), b = (int)bits(w, 20, 8);
+    uint32_t index = (uint32_t)bits(w, 36, 13), mask = (uint32_t)bits(w, 31, 4);
+    int type = (int)bits(w, 28, 3);
+    bool lod = bits(w, 55, 1), aoffi = bits(w, 35, 1), ms = bits(w, 50, 1), clamp = bits(w, 54, 1);
+    if (!c->glsl) { fail(c, "TLD (MSL)"); return; }
+    if (ms || clamp || type > 4) { fail(c, "TLD %s", ms ? "multisample" : clamp ? "clamp" : "cube / 3d array"); return; }
+    bool array = type == 1 || type == 3;
+    int n = type <= 1 ? 1 : type <= 3 ? 2 : 3;
+    int tt = type == 0 ? TEXTYPE_1D : type == 1 ? TEXTYPE_1D_ARRAY : type == 2 ? TEXTYPE_2D : type == 3 ? TEXTYPE_2D_ARRAY : TEXTYPE_3D;
+    int slot = tex_slot(c, index, tt, false, array);
+    if (c->fail) return;
+    for (int i = 0; i < n + array; i++) c->reg_used[a + i] = 1;
+    int ca = a + array, p = b;
+    char L[64] = "0", O[128] = "", ly[96] = "", co[512], call[1024];
+    if (lod) { c->reg_used[p] = 1; snprintf(L, sizeof L, "int(r%d)", p); p++; }
+    if (aoffi) {
+        c->reg_used[p] = 1;
+        if (n == 1) snprintf(O, sizeof O, " + (int(r%d << 28) >> 28)", p);
+        else if (n == 2) snprintf(O, sizeof O, " + int2(int(r%d << 28) >> 28, int(r%d << 24) >> 28)", p, p);
+        else snprintf(O, sizeof O, " + int3(int(r%d << 28) >> 28, int(r%d << 24) >> 28, int(r%d << 20) >> 28)", p, p, p);
+        p++;
+    }
+    if (array) snprintf(ly, sizeof ly, "int(min(r%d & 0xffffu, uint(tsize%d(0).z) - 1u))", a, slot);
+    if (n == 1) snprintf(co, sizeof co, "int(r%d)%s", ca, O);
+    else if (n == 2) snprintf(co, sizeof co, "ivec2(%s)", RSC2(c, slot, "uint2(int2(int(r%d), int(r%d))%s)", ca, ca + 1, O));
+    else snprintf(co, sizeof co, "ivec3(int(r%d), int(r%d), int(r%d))%s", ca, ca + 1, ca + 2, O);
+    if (array) snprintf(call, sizeof call, "texelFetch(t%d, %s(%s, %s), %s)", slot, n == 1 ? "ivec2" : "ivec3", co, ly, L);
+    else snprintf(call, sizeof call, "texelFetch(t%d, %s, %s)", slot, co, L);
     write_tex_result(c, slot, call, mask, d, RZ, false, false);
 }
 
@@ -1487,6 +1533,8 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         emit_tex(c, w, true);
     } else if (OPM(0xde38000000000000ull, 0xfff8000000000000ull)) {  // TXD
         emit_txd(c, w);
+    } else if (OPM(0xdc38000000000000ull, 0xfff8000000000000ull)) {  // TLD
+        emit_tld(c, w);
     } else if (OPM(0xc838000000000000ull, 0xfc38000000000000ull)) {  // TLD4
         emit_tld4(c, w);
     } else if (OPM(0xdf00000000000000ull, 0xff40000000000000ull)) {  // TLD4S

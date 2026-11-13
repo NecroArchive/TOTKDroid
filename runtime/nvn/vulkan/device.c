@@ -1824,6 +1824,18 @@ static void quick_exit_handler(void) {
 #endif
 }
 
+// The window closed: the pipeline cache saved and the process ended at once. Through exit(0), what was registered after
+// quick_exit_handler ran first - C++ static objects' destructors among them - while the game's, the render and the audio
+// threads still ran: one of them then locked a destroyed mutex and the app aborted on its way out ("FORTIFY:
+// pthread_mutex_lock called on a destroyed mutex", #29 #34 - a crash report for a normal close).
+void rt_window_closed(void) {
+    LOG("window closed\n");
+#if defined(_WIN32) || defined(__linux__)
+    quick_exit_handler();  // (ends the process)
+#endif
+    exit(0);
+}
+
 #ifdef __ANDROID__
 // Driver compatibility's Automatic (settings.h gpu_heap / inplace_reads / turnip_lrz, from LASRecompAndroid): the
 // fastest paths on the Adreno 8xx GPUs they were made on, the compatible ones elsewhere (an Adreno 750 drew LAS's text
@@ -2112,10 +2124,7 @@ int ui_run(void) {
 #ifdef __ANDROID__
             if (e.type == SDL_EVENT_WILL_ENTER_BACKGROUND && g_vk.dev) vk_pipeline_cache_save();  // (may not come back)
 #endif
-            if (e.type == SDL_EVENT_QUIT) {
-                LOG("window closed\n");
-                exit(0);
-            }
+            if (e.type == SDL_EVENT_QUIT) rt_window_closed();
             extern bool input_user_blocked(const SDL_Event *e);
             if (input_user_blocked(&e)) continue;  // scripted test runs: the real keyboard / mouse / pads do nothing (as metal.m)
 #ifdef __ANDROID__

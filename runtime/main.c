@@ -149,7 +149,11 @@ void audio_stop(void);                // services/audio.c: its threads read gues
 static void reboot_idle(void) {  // (main thread, while guest threads stop) keep the window alive
     SDL_Event e;
     while (SDL_PollEvent(&e))
+#ifdef __ANDROID__
+        if (e.type == SDL_EVENT_QUIT) { extern void rt_window_closed(void); rt_window_closed(); }  // (vulkan/device.c)
+#else
         if (e.type == SDL_EVENT_QUIT) { LOG("window closed\n"); exit(0); }
+#endif
 }
 
 static void teardown(void) {

@@ -644,9 +644,23 @@ static void builder_layout(uint64_t b, TexLayout *t) {
                                (unsigned long long)G(uint64_t, b, 0x50));
         }
     }
+    // MINIMAL_LAYOUT (texture flag 0x200): the driver keeps the automatic block height and depth only when the layer
+    // (every level) is no larger than with 1-GOB blocks, else it takes 1-GOB blocks (digitalhivehub's sweep of the
+    // driver, nxnative PR #11 / issue #183; documented in Swap2-Native's docs/reference/nvn-objects.md, MIT; the code is
+    // ours). TOTK's Depths terrain tiles keep two 320x320 RGB5A1 / RGB565 textures of 204,800 bytes each right before
+    // their patch tables: with 16 GOBs (245,760 bytes) the second one's write-back overwrote every other 4 KiB page
+    // of the tables and the patches came out as huge flat ceilings and walls (#37 #52). A packaged layout keeps its own.
+    // LARECOMP_NO_MINIMAL_LAYOUT=1: the flag ignored, as before
+    static int nominimal = -1;
+    if (nominimal < 0) nominimal = getenv("LARECOMP_NO_MINIMAL_LAYOUT") != NULL;
+    uint64_t pl = G(uint64_t, b, 0x50);
+    if ((G(uint32_t, b, 8) & 0x200) && !pl && !nominimal && (t->block_height_log2 || t->block_depth_log2)) {
+        TexLayout one = *t;
+        one.block_height_log2 = one.block_depth_log2 = 0;
+        if (tegra_layer_size(&one) != tegra_layer_size(t)) t->block_height_log2 = t->block_depth_log2 = 0;
+    }
     // Packaged textures (BNTX) were swizzled offline with their own block height, which can differ
     // from the driver default: NVNpackagedTextureLayout's low word is log2(GOBs per block).
-    uint64_t pl = G(uint64_t, b, 0x50);
     if (pl && (uint32_t)pl <= 5) t->block_height_log2 = (uint32_t)pl;
     if (pl && getenv("LARECOMP_LOG_PACKAGED")) {
         static int n;
