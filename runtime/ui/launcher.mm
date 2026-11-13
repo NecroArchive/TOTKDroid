@@ -537,7 +537,8 @@ static void android_call_int(const char *method, int v) {  // (one int argument)
 // The log file (Driver compatibility; runtime/platform/android.c): written to a folder the player picks
 // (TOTKRecompAndroidActivity pickLogFolder / openLog), where a file manager can open it - Android/data/ is out of its reach
 extern "C" void android_log_file(bool on);
-extern "C" bool vk_adreno_8xx(const char *name);  // (Driver compatibility's Automatic: runtime/nvn/vulkan/device.c)
+extern "C" bool vk_adreno_8xx(const char *name);
+extern "C" bool vk_adreno_7xx_8xx(const char *name);  // (Driver compatibility's Automatic: runtime/nvn/vulkan/device.c)
 extern "C" const char *vk_driver_env_at_start(void);
 extern "C" bool vk_lrz_at_start(void);
 extern "C" bool vk_heap_file_possible(void);
@@ -1524,10 +1525,11 @@ static void prelaunch_tab(float sc) {
         // LASRecompAndroid's, with BOTW's in-place reads of draw targets)
         bool changed = false;
         const bool a8 = vk_adreno_8xx(vk_gpu_name());  // (Automatic: on for Adreno 8xx only)
-        auto tri = [&](const char *id, int *v) {  // Automatic / On / Off: -1 / 1 / 0
+        const bool a78 = vk_adreno_7xx_8xx(vk_gpu_name());  // (in-place reads: 7xx too, #48)
+        auto tri = [&](const char *id, int *v, bool auto_on) {  // Automatic / On / Off: -1 / 1 / 0
             bool ch = false;
             ImGui::PushID(id);
-            ch |= ImGui::RadioButton(tr(a8 ? "Automatic (on for this GPU)" : "Automatic (off for this GPU)"), v, -1);
+            ch |= ImGui::RadioButton(tr(auto_on ? "Automatic (on for this GPU)" : "Automatic (off for this GPU)"), v, -1);
             ImGui::SameLine();
             ch |= ImGui::RadioButton(tr("On"), v, 1);
             ImGui::SameLine();
@@ -1544,7 +1546,7 @@ static void prelaunch_tab(float sc) {
             ImGui::TextDisabled("%s", tr("These options are for Turnip: the driver in use takes the safer paths anyway."));
         ImGui::Spacing();
         ImGui::Text("%s", tr("Game memory on the GPU (Turnip)"));
-        changed |= tri("heap", &g_settings.gpu_heap);
+        changed |= tri("heap", &g_settings.gpu_heap, a8);
         ImGui::TextDisabled("%s", tr("On: the game's memory is mapped straight into the GPU's, the fastest way. Off: what each "
                                   "frame uses is copied instead - it draws right where the fast way doesn't, but this game "
                                   "runs at about half the frame rate (15 fps instead of 35 on an Adreno 830). Automatic: on "
@@ -1560,13 +1562,13 @@ static void prelaunch_tab(float sc) {
             ImGui::TextDisabled("%s", tr("This driver can't export its memory: the option does nothing here."));
         ImGui::Spacing();
         ImGui::Text("%s", tr("Draw-target reads in place (Turnip)"));
-        changed |= tri("inplace", &g_settings.inplace_reads);
+        changed |= tri("inplace", &g_settings.inplace_reads, a78);
         ImGui::TextDisabled("%s", tr("On: decals and effects read the image they draw on as it is, the fastest way. Off: a copy "
-                                  "of it each time, slower (fewer fps) but by the Vulkan rules. Automatic: on for Adreno 8xx "
-                                  "GPUs, off for the others. Applies when the game starts."));
+                                  "of it each time, slower (fewer fps) but by the Vulkan rules. Automatic: on for Adreno 7xx "
+                                  "and 8xx GPUs, off for the others. Applies when the game starts."));
         ImGui::Spacing();
         ImGui::Text("%s", tr("Turnip low-resolution Z (LRZ)"));
-        changed |= tri("lrz", &g_settings.turnip_lrz);
+        changed |= tri("lrz", &g_settings.turnip_lrz, a8);
         ImGui::TextDisabled("%s", tr("Turnip's early depth test, a little faster. Off can fix missing or broken drawing on "
                                   "some Adreno GPUs. Automatic: on for Adreno 8xx GPUs, off for the others. Applies when "
                                   "TOTKDroid restarts."));

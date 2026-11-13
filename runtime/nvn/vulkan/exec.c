@@ -3878,8 +3878,8 @@ static void resolve_feedback(Prog *pr, uint32_t draw_written) {
                 // the start screen's Driver compatibility; LARECOMP_FEEDBACK_INPLACE=1 on any driver).
                 if (g_inplace_copy < 0) {
                     extern bool vk_driver_is_turnip(void);
-                    extern bool vk_turnip_path_on(int setting);
-                    bool inplace = getenv("LARECOMP_FEEDBACK_INPLACE") || (vk_driver_is_turnip() && vk_turnip_path_on(g_settings.inplace_reads));
+                    extern bool vk_inplace_reads_on(int setting);  // (Automatic: Adreno 7xx and 8xx - device.c, #48)
+                    bool inplace = getenv("LARECOMP_FEEDBACK_INPLACE") || (vk_driver_is_turnip() && vk_inplace_reads_on(g_settings.inplace_reads));
                     g_inplace_copy = getenv("LARECOMP_FEEDBACK_COPY") != NULL || !inplace;
                     LOG("[vk] targets a draw writes, sampled by it: %s (%s)\n", g_inplace_copy ? "copies" : "in place",
                         g_settings.inplace_reads < 0 ? "automatic" : "settings");

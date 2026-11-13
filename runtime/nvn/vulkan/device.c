@@ -1837,6 +1837,18 @@ bool vk_adreno_8xx(const char *name) {
 }
 // A Turnip path's setting (-1 Automatic, 1 on, 0 off) for this GPU
 bool vk_turnip_path_on(int setting) { return setting < 0 ? vk_adreno_8xx(g_vk.props.deviceName) : setting != 0; }
+
+// Draw-target reads in place (exec.c resolve_feedback): Automatic is on for Adreno 7xx as well as 8xx. With copies, an
+// Adreno 740's first shrine made ~10,000 copies of whole targets a second - 30 fps fell to 5-8 (#48); the 7xx's 732 and
+// 740 flickered and crawled the same way (#26 #29). Checked frame by frame on the Adreno 830 only: Off is the way back.
+bool vk_adreno_7xx_8xx(const char *name) {
+    const char *a = name ? strstr(name, "Adreno") : NULL;
+    if (!a) return false;
+    while (*a && (*a < '0' || *a > '9')) a++;
+    int n = atoi(a);
+    return n >= 700 && n < 900;
+}
+bool vk_inplace_reads_on(int setting) { return setting < 0 ? vk_adreno_7xx_8xx(g_vk.props.deviceName) : setting != 0; }
 int vk_between_fps(void) {
     static int fps = 45;
     static uint64_t next;
