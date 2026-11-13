@@ -504,6 +504,7 @@ done:
 // no copy of its ~15 GB first; only the movies, opened by path, stay loose - LASRecompAndroid's), then the setup goes
 // on as on the desktop with the game code (runtime/gamebuild.c, on the phone itself). The Vulkan driver is
 // picked the same way (a Turnip .zip, copied to the drivers folder the activity loads from at start).
+#include <fcntl.h>
 #include <jni.h>
 std::atomic<bool> g_android_imported{false};
 static std::string g_driver_msg;
@@ -795,6 +796,57 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_totkrecompandroid_TOTKRecompAndroi
 }
 
 // The import thread's cause of a failure (an exception: "IOException: ..."), ahead of nativeImportDone
+// nativeBuildRomfs for a romfs/ read by its path (the access to all files): its files listed and opened here, not one
+// by one through the file provider - that took hours at "Searching files... 0%" and then for the copy (#21, #16).
+static void list_romfs(const std::string &dir, const std::string &rel, std::vector<std::string> &paths, std::vector<uint64_t> &sizes) {
+    DIR *d = opendir(dir.c_str());
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        std::string p = dir + "/" + e->d_name, r = rel.empty() ? e->d_name : rel + "/" + e->d_name;
+        struct stat st;
+        if (stat(p.c_str(), &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) list_romfs(p, r, paths, sizes);
+        else if (S_ISREG(st.st_mode)) paths.push_back(r), sizes.push_back((uint64_t)st.st_size);
+    }
+    closedir(d);
+}
+struct RomfsDir { const std::string *dir; const std::vector<std::string> *paths; };
+static int romfs_dir_open(void *ctx, int index) {
+    RomfsDir *r = (RomfsDir *)ctx;
+    return open((*r->dir + "/" + (*r->paths)[index]).c_str(), O_RDONLY | O_CLOEXEC);
+}
+extern "C" JNIEXPORT jstring JNICALL Java_com_totkrecompandroid_TOTKRecompAndroidActivity_nativeBuildRomfsDir(JNIEnv *env, jclass,
+                                                                                                           jstring dir) {
+    const char *c = env->GetStringUTFChars(dir, NULL);
+    std::string src = c ? c : "";
+    if (c) env->ReleaseStringUTFChars(dir, c);
+    set_job("Building the game data image...");
+    std::vector<std::string> paths;
+    std::vector<uint64_t> sizes;
+    list_romfs(src, "", paths, sizes);
+    std::vector<RomfsEntry> entries(paths.size());
+    uint64_t bytes = 0;
+    for (size_t i = 0; i < paths.size(); i++) entries[i] = {paths[i].c_str(), sizes[i]}, bytes += sizes[i];
+    fprintf(stderr, "[launcher] romfs/ read by its path: %zu files, %.1f GB (%s)\n", paths.size(), bytes / 1e9, src.c_str());
+    g_phase_base = g_done;  // (exefs/ copied: the image's bytes follow)
+    g_total = g_done + bytes;
+    char why[256] = "";
+    std::string dest = setup_dest(), romfs = dest + "/romfs";
+    mkdir(romfs.c_str(), 0755);
+    RomfsDir r = {&src, &paths};
+    bool ok = romfs_build_entries(entries.data(), (int)entries.size(), romfs_dir_open, &r, (dest + "/romfs.bin").c_str(),
+                                  romfs.c_str(), keep_loose, setup_progress, why, sizeof why);
+    if (ok) return NULL;
+    fprintf(stderr, "[launcher] romfs image: %s\n", why);
+    const char *what = why[0] ? why : "Could not build the game data image. Check free storage and try again.";
+    pthread_mutex_lock(&g_lock);
+    g_fail_detail = what;  // (nativeImportDone(5) follows)
+    pthread_mutex_unlock(&g_lock);
+    return env->NewStringUTF(what);
+}
+
 extern "C" JNIEXPORT void JNICALL Java_com_totkrecompandroid_TOTKRecompAndroidActivity_nativeImportDetail(JNIEnv *env, jclass,
                                                                                                          jstring what) {
     const char *c = what ? env->GetStringUTFChars(what, NULL) : NULL;

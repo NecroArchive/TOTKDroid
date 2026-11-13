@@ -106,6 +106,10 @@ extern bool maxwell_gmem_map_all;
 extern bool maxwell_gmem_bda;
 // Vulkan drivers without shaderInt64: preserve address/carry semantics using 32-bit words.
 extern bool maxwell_no_int64;
+// (GLSL) the stages (1 << STAGE_*) where VOTE, SHFL and the lane ids use subgroup operations; elsewhere, as in vertex
+// shaders, each invocation is one lane by itself. The driver's VkPhysicalDeviceSubgroupProperties: Turnip on Adreno
+// 6xx has them in compute only (#8). Default: all.
+extern unsigned maxwell_subgroup_stages;
 // (diagnostics, Android copy mode) a mapped access outside the table records its heap offset at the end of the gfast_
 // buffer (the arena: exec.c) instead of reading the heap binding, which isn't there
 extern bool maxwell_gmem_miss_log;

@@ -45,6 +45,7 @@ Android.
 - Taxa de quadros: Vídeo > Taxa de quadros tem 30, Auto (prefere 60, cutscenes em 30) e 60. A resolução dinâmica do
   jogo fica desligada; a cena é 1600x896, escalada para a saída (FSR 1, GSR, SMAA / FXAA).
 - Vídeo > Proporção > Desbloqueado: o mundo e os menus ocupam a tela larga (o HUD fica nos 16:9 do meio).
+- Vídeo > Geração de quadros (LSFG), experimental: quadros criados entre os do jogo (2x, 3x, 4x). É a do Lossless Scaling, portada do Eden pelo Swap2-Native, e precisa da sua própria `Lossless.dll` do Lossless Scaling na pasta `LSFG` ou `Download` do armazenamento do celular. A DLL nunca vem junto. Esse código é GPL-3.0-or-later, e por isso o APK feito com ele também é ([NOTICE.md](NOTICE.md)).
 - Falta: a maior parte do mapa, 60 fps sustentados com o celular quente, o HUD nas bordas da tela no modo largo.
 
 > [!IMPORTANT]
@@ -111,6 +112,7 @@ A meta atual do projeto é adquirir um **POCO X7 Pro (US$ 455)**, um celular de 
 - [Revivedx](https://github.com/Revivedx) pelo [SavageWindRecomp](https://github.com/Revivedx/SavageWindRecomp) (MIT):
   as correções de kernel do SDK 20, o setjmp, o NVN 55.
 - [Nycolazs](https://github.com/Nycolazs) pelo LASRecomp-Android-Plus (MIT): compatibilidade de drivers Vulkan.
+- [Eden](https://git.eden-emu.dev/eden-emu/eden) e [lsfg-vk](https://github.com/PancakeTAS/lsfg-vk) (GPL-3.0-or-later): a geração de quadros do Lossless Scaling, pelo port em C do Swap2-Native (runtime/nvn/vulkan/lsfg, NOTICE.md).
 - A decompilação [zeldaret/botw](https://github.com/zeldaret/botw) e o [open-ead/sead](https://github.com/open-ead/sead),
   pelo que se sabe do motor de onde o TOTK veio.
 - Upscaling e anti-aliasing: [AMD FidelityFX FSR 1](https://github.com/GPUOpen-Effects/FidelityFX-FSR) (MIT),

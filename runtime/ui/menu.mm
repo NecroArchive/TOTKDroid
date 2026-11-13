@@ -51,6 +51,8 @@ struct QEvent {
 static pthread_mutex_t q_lock = PTHREAD_MUTEX_INITIALIZER;
 static std::vector<QEvent> q_events;
 static float g_pixel_density = 1;
+float g_screen_dp = 0;  // the screen's density (Android: px a dp) and height in pixels, for ui/perf_overlay.mm
+int g_screen_h_px = 0;
 
 static void push(const QEvent &e) {
     pthread_mutex_lock(&q_lock);
@@ -61,6 +63,8 @@ static void push(const QEvent &e) {
 bool menu_is_open(void) { return g_open.load(); }
 #ifdef __ANDROID__
 extern "C" bool touch_controls_visible(void);  // ui/touch_controls.mm
+extern "C" const char *vk_fg_status(void);      // nvn/vulkan/framegen.c
+extern "C" bool vk_fg_built(void);
 extern "C" void touch_controls_draw(ImVec2 display, ImFont *font);
 #endif
 static void set_open(bool open);
@@ -275,6 +279,12 @@ bool menu_handle_event(const SDL_Event *e) {
 void menu_apply_window_requests(void *win) {
     SDL_Window *w = (SDL_Window *)win;
     g_pixel_density = SDL_GetWindowPixelDensity(w);
+    {  // (the performance overlay sizes itself in Android's dp, as Swap2-Native's: ui/perf_overlay.mm)
+        int pw = 0, ph = 0;
+        SDL_GetWindowSizeInPixels(w, &pw, &ph);
+        g_screen_h_px = ph;
+        g_screen_dp = SDL_GetDisplayContentScale(SDL_GetDisplayForWindow(w));
+    }
     static bool text_input;
     bool want_text = capturing();
 #ifdef __ANDROID__
@@ -304,8 +314,10 @@ void menu_apply_window_requests(void *win) {
 
 // ------------------------------------------------------------------ render thread
 static bool g_inited;
+static bool g_drawn_frame;  // (menu_render drew the overlay last frame: menu_render_again)
 static ImGuiContext *g_ctx;  // ours: the start screen (back to it after a reboot) has its own context
 static ImFont *g_font, *g_font_big;
+ImFont *g_overlay_font;  // the performance overlay's (Android's Roboto, as Swap2-Native's): ui/perf_overlay.mm
 static ImFont *g_menu_font, *g_menu_font_big;  // the menu window (Baloo 2); everything else keeps g_font
 static int g_tab, g_tab_request = -2;  // (-2: no request; -1 is the Prelaunch tab)
 static int g_focus_tab = -99;  // put the nav cursor on this tab next frame (-100: the selected one; -99: none)
@@ -409,6 +421,14 @@ static void init(void) {
         g_menu_font_big = io.Fonts->AddFontFromFileTTF(baloo, 72, &cfg);
         i18n_merge_fonts(io.Fonts, 72);
     }
+#ifdef __ANDROID__
+    for (const char *p : {"/system/fonts/RobotoStatic-Regular.ttf", "/system/fonts/Roboto-Regular.ttf"}) {
+        if (FILE *f = fopen(p, "rb")) fclose(f);
+        else continue;
+        g_overlay_font = io.Fonts->AddFontFromFileTTF(p, 48, &cfg);
+        break;
+    }
+#endif
     if (!g_font) g_font = io.Fonts->AddFontDefault();
     if (!g_font_big) g_font_big = g_font;
     if (!g_menu_font || !g_menu_font_big) g_menu_font = g_font, g_menu_font_big = g_font_big;
@@ -530,14 +550,36 @@ static void tab_display(void) {
 #endif
 #ifdef __ANDROID__
     opt_toggle("Show FPS", &g_settings.show_fps, false,
-               "Shows the performance overlay: the frame rate and how the phone is doing. Drag it with a finger to move it.");
-    {   // (ui/perf_overlay.mm; LASRecompAndroid's)
-        static const char *styles[] = {"Full", "Compact"};
-        if (!g_settings.show_fps) opt_disable_next();
+               "Shows the performance overlay: the frame rate and how the phone is doing. Drag it with a finger to move it; "
+               "double-tap it to switch compact / detailed.");
+    if (g_settings.show_fps) {  // (ui/perf_overlay.mm; LASRecompAndroid's, with Swap2-Native's overlay's settings - BOTW's)
+        opt_indent(1);
+        static const char *styles[] = {"Detailed", "Compact"};
         opt_choice("Overlay style", &g_settings.overlay_style, styles, 2, 0,
-                   "Full: frame rate and frame times, CPU, GPU, memory, temperatures and power. Compact: one line - FPS, "
-                   "the app's RAM, the SoC's and the battery's temperature. Either one can be dragged anywhere on the "
-                   "screen with a finger.");
+                   "Detailed: the GPU, frame rate and frame time with 48 s charts, CPU clock caps, temperatures, battery, "
+                   "free memory and thermal state. Compact: one line - frame rate, frame time, RAM and temperatures. "
+                   "Double-tap the overlay to switch; drag it to move it.");
+        if (g_settings.overlay_scale < 40 || g_settings.overlay_scale > 150) g_settings.overlay_scale = 75;
+        if (g_settings.overlay_opacity < 20 || g_settings.overlay_opacity > 100) g_settings.overlay_opacity = 100;
+        opt_int("Overlay size", &g_settings.overlay_scale, 40, 150, 5, 75, "%d%%", "How big the overlay's text is.");
+        opt_int("Overlay opacity", &g_settings.overlay_opacity, 20, 100, 5, 100, "%d%%",
+                "How see-through the overlay is: lower lets more of the game show through.");
+        static const struct { int bit; const char *label, *desc; } items[] = {
+            {OVERLAY_FPS, "Frame rate and frame time", "The game's frames a second and the time of one; with frame "
+                                                       "generation, the game's > the shown rate."},
+            {OVERLAY_THROTTLE, "Thermal state", "Android's thermal state, T: 0 (none) to 6 (shutdown): how much the phone is "
+                                                "holding back for heat."},
+            {OVERLAY_GPU, "GPU time", "The GPU's time for one frame."},
+            {OVERLAY_CPU, "CPU clock caps", "Each CPU cluster's current top clock against its highest."},
+            {OVERLAY_BATTERY, "Battery and temperatures", "The SoC's and the battery's temperature, and the battery's level."},
+            {OVERLAY_MEMORY, "Memory", "The game's memory (and its chart) and the phone's free memory."},
+        };
+        for (const auto &it : items) {
+            bool on = (g_settings.overlay_items & it.bit) != 0;
+            if (opt_toggle(it.label, &on, true, it.desc))
+                g_settings.overlay_items = on ? g_settings.overlay_items | it.bit : g_settings.overlay_items & ~it.bit;
+        }
+        opt_indent(-1);
     }
 #else
     opt_toggle("Show FPS", &g_settings.show_fps, false, "Shows the frame rate in the top right corner.");
@@ -566,6 +608,28 @@ static void tab_display(void) {
 
 #ifdef __ANDROID__
     if (g_settings.fps_mode == 4) ImGui::TextWrapped("%s", tr("40 fps on a 120 Hz display, 45 on 90 Hz, 30 on 60 Hz."));
+    {   // Frame generation (Lossless Scaling's LSFG with the player's own Lossless.dll: nvn/vulkan/framegen.c)
+        static const char *fg[] = {"Off", "2x", "3x", "4x"};
+        int v = g_settings.lsfg ? g_settings.lsfg_mult - 1 : 0;
+        if (opt_choice("Frame generation (LSFG)", &v, fg, 4, 0,
+                       "Shows frames made between the game's own, for smoother motion (Lossless Scaling's frame "
+                       "generation). Needs your own Lossless.dll from Lossless Scaling: put it in the LSFG or Download folder "
+                       "of the phone's storage. Adds a little delay and needs a spare GPU; 2x on 30 fps shows 60.")) {
+            g_settings.lsfg = v > 0;
+            if (v > 0) g_settings.lsfg_mult = v + 1;
+        }
+        if (g_settings.lsfg) {
+            static const char *fl[] = {"Auto", "25%", "50%", "75%", "100%"};
+            static const int flv[] = {0, 25, 50, 75, 100};
+            int k = 0;
+            for (int i = 0; i < 5; i++) if (flv[i] == g_settings.lsfg_flow) k = i;
+            if (opt_choice("Motion estimation", &k, fl, 5, 3,
+                           "The resolution the motion between frames is measured at: lower is faster, higher looks cleaner. "
+                           "Auto: the game's own."))
+                g_settings.lsfg_flow = flv[k];
+            ImGui::TextWrapped("%s", vk_fg_built() ? vk_fg_status() : tr("Not in this build."));
+        }
+    }
 #endif
     opt_section("Rendering");
     // display order -> RES_* (the ini / enum order predates the menu order)
@@ -1289,6 +1353,9 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
 #endif
     if (!open && !kbd && !g_settings.show_fps && !touch) {
         if (g_inited) { pthread_mutex_lock(&q_lock); q_events.clear(); pthread_mutex_unlock(&q_lock); }
+#ifndef __APPLE__
+        g_drawn_frame = false;  // (nothing on screen: menu_render_again draws nothing either)
+#endif
         return;
     }
 #ifdef __APPLE__
@@ -1424,5 +1491,17 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
     [enc endEncoding];
 #else
     ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), (VkCommandBuffer)cmd);  // inside the window image's rendering
+    g_drawn_frame = true;
 #endif
 }
+
+#ifndef __APPLE__
+// The overlay as the last menu_render drew it, again (a generated frame between two game frames: nvn/vulkan/framegen.c):
+// its draw lists stay as they were until the next frame's
+void menu_render_again(void *cmd) {
+    if (!g_inited || !g_drawn_frame) return;
+    ImGui::SetCurrentContext(g_ctx);
+    ImDrawData *d = ImGui::GetDrawData();
+    if (d && d->Valid) ImGui_ImplVulkan_RenderDrawData(d, (VkCommandBuffer)cmd);
+}
+#endif

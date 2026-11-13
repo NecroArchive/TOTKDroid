@@ -25,6 +25,8 @@ void menu_render(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> targ
 #elif !defined(__APPLE__)
 // Render thread, inside the window image's rendering (Vulkan command buffer cmd).
 void menu_render(void *cmd, uint32_t target_w, uint32_t target_h);
+// The overlay as the last menu_render drew it, again (a generated frame: nvn/vulkan/framegen.c)
+void menu_render_again(void *cmd);
 #endif
 
 #ifdef __cplusplus

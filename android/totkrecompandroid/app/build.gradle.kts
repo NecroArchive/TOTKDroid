@@ -32,6 +32,10 @@ android {
         externalNativeBuild {
             cmake {
                 arguments += "-DTOTK_GEN_DIR=${gen.get().asFile.resolve("inc").absolutePath.replace('\\', '/')}"
+                // Lossless Scaling frame generation (runtime/nvn/vulkan/lsfg, GPL-3.0-or-later): in by default, which makes the
+                // APK GPL-3.0-or-later (NOTICE.md); -PtotkLsfg=false builds without it
+                val lsfg = providers.gradleProperty("totkLsfg").getOrElse("true") != "false"
+                arguments += "-DTOTK_LSFG=${if (lsfg) "ON" else "OFF"}"
             }
         }
     }

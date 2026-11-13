@@ -5,6 +5,7 @@
 // (the game runs on it: an uncached map crawls, as Mali's coherent type did in 0.2.3), and whether the GPU sees what the
 // CPU wrote and the CPU what the GPU wrote. Once, at the device's start, before the game; the log says it all.
 #ifdef __ANDROID__
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -67,11 +68,22 @@ static void probe_type(uint32_t type, VkMemoryPropertyFlags flags, VkExternalMem
     int fd = -1;
     uint8_t *p = MAP_FAILED;
     const char *why = NULL;
+    bool dedicated = false;  // (exported only as the buffer's own allocation: exec.c heap_export_ok)
+    {
+        VkPhysicalDeviceExternalBufferInfo q = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_BUFFER_INFO,
+                                                .usage = bci.usage, .handleType = ht};
+        VkExternalBufferProperties ep = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_BUFFER_PROPERTIES};
+        vkGetPhysicalDeviceExternalBufferProperties(g_vk.phys, &q, &ep);
+        VkExternalMemoryFeatureFlags f = ep.externalMemoryProperties.externalMemoryFeatures;
+        dedicated = (f & VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT) != 0;
+        if (!(f & VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT)) { why = "not exportable (features 0)"; goto done; }
+    }
     if (vkCreateBuffer(g_vk.dev, &bci, NULL, &buf) != VK_SUCCESS) { why = "buffer"; goto done; }
     VkMemoryRequirements mr;
     vkGetBufferMemoryRequirements(g_vk.dev, buf, &mr);
     if (!(mr.memoryTypeBits & (1u << type))) { why = "the buffer can't use this type"; goto done; }
-    VkExportMemoryAllocateInfo ex = {.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
+    VkMemoryDedicatedAllocateInfo ded = {.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, .buffer = buf};
+    VkExportMemoryAllocateInfo ex = {.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO, .pNext = dedicated ? &ded : NULL,
                                      .handleTypes = ht};
     VkMemoryAllocateInfo mai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &ex, .allocationSize = mr.size,
                                 .memoryTypeIndex = type};
@@ -115,17 +127,80 @@ static void probe_type(uint32_t type, VkMemoryPropertyFlags flags, VkExternalMem
         cpu_sees = true;
         for (int i = 0; i < 4096 && cpu_sees; i++) cpu_sees = p[(8u << 20) + 4096 + i] == 0x5a;
     }
-    LOG("[memfd] %s, type %u (flags 0x%x%s%s): exported and mapped; CPU writes %.1f GB/s, reads %.1f GB/s; the GPU %s the CPU's "
-        "bytes, the CPU %s the GPU's\n", kind, type, (unsigned)flags, flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT ? " cached" : "",
-        flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT ? " coherent" : "", wr, rd,
-        !gpu_ok ? "(submission failed)" : gpu_sees ? "sees" : "does NOT see", !gpu_ok ? "-" : cpu_sees ? "sees" : "does NOT see");
+    LOG("[memfd] %s%s, type %u (flags 0x%x%s%s): exported and mapped; CPU writes %.1f GB/s, reads %.1f GB/s; the GPU %s the "
+        "CPU's bytes, the CPU %s the GPU's\n", kind, dedicated ? " (dedicated)" : "", type, (unsigned)flags,
+        flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT ? " cached" : "", flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT ? " coherent" : "",
+        wr, rd, !gpu_ok ? "(submission failed)" : gpu_sees ? "sees" : "does NOT see", !gpu_ok ? "-" : cpu_sees ? "sees" : "does NOT see");
 done:
-    if (why) LOG("[memfd] %s, type %u (flags 0x%x): failed at %s\n", kind, type, (unsigned)flags, why);
+    if (why) LOG("[memfd] %s%s, type %u (flags 0x%x): failed at %s (errno %d)\n", kind, dedicated ? " (dedicated)" : "", type,
+                 (unsigned)flags, why, errno);
     if (p != MAP_FAILED) munmap(p, PROBE_SIZE);
     if (fd >= 0) close(fd);
     if (out) vkDestroyBuffer(g_vk.dev, out, NULL);
     if (buf) vkDestroyBuffer(g_vk.dev, buf, NULL);
     if (mem) vkFreeMemory(g_vk.dev, mem, NULL);
+}
+
+#ifndef MREMAP_FIXED
+#define MREMAP_FIXED 2
+#endif
+// Without a file (exec.c heap_move_map): memory of this type mapped by the driver, the map moved to another address with
+// mremap - does it move, does the CPU run fast there, does the GPU see what the CPU wrote through it?
+static void probe_move(uint32_t type, VkMemoryPropertyFlags flags) {
+    VkBufferCreateInfo bci = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = PROBE_SIZE,
+                              .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    VkBuffer buf = VK_NULL_HANDLE, out = VK_NULL_HANDLE;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    void *q = NULL, *at = MAP_FAILED;
+    bool moved = false;
+    const char *why = NULL;
+    if (vkCreateBuffer(g_vk.dev, &bci, NULL, &buf) != VK_SUCCESS) { why = "buffer"; goto done; }
+    VkMemoryRequirements mr;
+    vkGetBufferMemoryRequirements(g_vk.dev, buf, &mr);
+    if (!(mr.memoryTypeBits & (1u << type))) { why = "the buffer can't use this type"; goto done; }
+    VkMemoryAllocateInfo mai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size, .memoryTypeIndex = type};
+    if (vkAllocateMemory(g_vk.dev, &mai, NULL, &mem) != VK_SUCCESS) { why = "allocation"; goto done; }
+    if (vkBindBufferMemory(g_vk.dev, buf, mem, 0) != VK_SUCCESS) { why = "bind"; goto done; }
+    if (vkMapMemory(g_vk.dev, mem, 0, VK_WHOLE_SIZE, 0, &q) != VK_SUCCESS || !q) { why = "vkMapMemory"; goto done; }
+    at = mmap(NULL, mr.size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);  // (the place to move it to)
+    if (at == MAP_FAILED) { why = "a place to move it to"; goto done; }
+    if (mremap(q, mr.size, mr.size, MREMAP_MAYMOVE | MREMAP_FIXED, at) != at) { why = "mremap"; goto done; }
+    moved = true;
+    uint8_t *p = at, *tmp = malloc(PROBE_SIZE);
+    if (!tmp) { why = "memory"; goto done; }
+    memset(tmp, 0x11, PROBE_SIZE);
+    double t0 = now_s();
+    for (int i = 0; i < 4; i++) memcpy(p, tmp, PROBE_SIZE);
+    double t1 = now_s();
+    for (int i = 0; i < 4; i++) memcpy(tmp, p, PROBE_SIZE);
+    double t2 = now_s();
+    free(tmp);
+    for (int i = 0; i < 4096; i++) p[i] = (uint8_t)(i * 7 + 3);
+    bool gpu_ok = false, gpu_sees = false;
+    VkBufferCreateInfo vbi = bci;
+    vbi.size = 1u << 20;
+    if (vkCreateBuffer(g_vk.dev, &vbi, NULL, &out) == VK_SUCCESS && vkBindBufferMemory(g_vk.dev, out, mem, 8u << 20) == VK_SUCCESS)
+        gpu_ok = gpu_round(buf, out);
+    if (gpu_ok) {
+        gpu_sees = true;
+        for (int i = 0; i < 4096 && gpu_sees; i++) gpu_sees = p[(8u << 20) + i] == (uint8_t)(i * 7 + 3);
+    }
+    LOG("[memfd] the driver's map moved, type %u (flags 0x%x): moved; CPU writes %.1f GB/s, reads %.1f GB/s; the GPU %s the "
+        "CPU's bytes\n", type, (unsigned)flags, 4.0 * PROBE_SIZE / (t1 - t0) / 1e9, 4.0 * PROBE_SIZE / (t2 - t1) / 1e9,
+        !gpu_ok ? "(submission failed)" : gpu_sees ? "sees" : "does NOT see");
+done:
+    if (why) LOG("[memfd] the driver's map moved, type %u (flags 0x%x): failed at %s (errno %d)\n", type, (unsigned)flags, why, errno);
+    if (out) vkDestroyBuffer(g_vk.dev, out, NULL);
+    if (buf) vkDestroyBuffer(g_vk.dev, buf, NULL);
+    if (moved) {  // (the driver's old range held while it unmaps it: then the moved map goes)
+        void *hold = mmap(q, mr.size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0);
+        if (mem) vkFreeMemory(g_vk.dev, mem, NULL);
+        if (hold != MAP_FAILED) munmap(hold, mr.size);
+        munmap(at, mr.size);
+    } else {
+        if (at != MAP_FAILED) munmap(at, mr.size);
+        if (mem) vkFreeMemory(g_vk.dev, mem, NULL);
+    }
 }
 
 void vk_memfd_probe(void) {
@@ -137,6 +212,7 @@ void vk_memfd_probe(void) {
     for (uint32_t i = 0; i < mp.memoryTypeCount; i++) {
         VkMemoryPropertyFlags f = mp.memoryTypes[i].propertyFlags;
         if (!(f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) continue;
+        probe_move(i, f);  // (no file at all: exec.c heap_move_map)
         probe_type(i, f, VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT);
         if (g_vk.mem_dmabuf) probe_type(i, f, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT);  // (the other file kind, #234)
     }

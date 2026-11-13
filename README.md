@@ -44,6 +44,10 @@ Android only (arm64, Vulkan). Windows, Linux or macOS may be used as development
 - Frame rate: Video > Frame rate has 30, Auto (prefers 60, cutscenes held at 30) and 60. The game's own dynamic
   resolution is off; the scene is 1600x896, scaled to the output (FSR 1, GSR, SMAA / FXAA).
 - Video > Aspect ratio > Unlocked: the world and the menus fill a wide screen (the HUD stays in the middle 16:9).
+- Video > Frame generation (LSFG), experimental: frames made between the game's own (2x, 3x, 4x). It is Lossless Scaling's,
+  ported from Eden through Swap2-Native, and needs your own `Lossless.dll` from Lossless Scaling in the `LSFG` or
+  `Download` folder of the phone's storage. The DLL is never included. This code is GPL-3.0-or-later, so the APK built
+  with it is too ([NOTICE.md](NOTICE.md)).
 - Not done yet: most of the map, sustained 60 fps on a hot phone, the HUD at the screen's edges in wide mode.
 
 > [!IMPORTANT]
@@ -109,6 +113,7 @@ Current goal: buy a **POCO X7 Pro ($455)**, a test device equipped with a MediaT
 - [Revivedx](https://github.com/Revivedx) for [SavageWindRecomp](https://github.com/Revivedx/SavageWindRecomp) (MIT):
   the SDK 20 kernel fixes, setjmp, NVN 55.
 - [Nycolazs](https://github.com/Nycolazs) for LASRecomp-Android-Plus (MIT): Vulkan driver compatibility.
+- [Eden](https://git.eden-emu.dev/eden-emu/eden) and [lsfg-vk](https://github.com/PancakeTAS/lsfg-vk) (GPL-3.0-or-later): Lossless Scaling frame generation, through Swap2-Native's C port (runtime/nvn/vulkan/lsfg, NOTICE.md).
 - The [zeldaret/botw](https://github.com/zeldaret/botw) decompilation and [open-ead/sead](https://github.com/open-ead/sead),
   for what is known about the engine TOTK grew from.
 - Upscaling and anti-aliasing: [AMD FidelityFX FSR 1](https://github.com/GPUOpen-Effects/FidelityFX-FSR) (MIT),

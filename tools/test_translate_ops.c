@@ -40,6 +40,15 @@ static uint64_t hsetp2(int pa, int pb, int a, int b, int cmp, int p, bool pneg, 
 }
 
 // LDC Rd, c[bank][Ra + off] (32-bit)
+// R2P / P2R with an immediate mask (0x38f0 / 0x38e8): .CC (bit 40), the byte (bits 41-42), Ra, the mask in bits 20-38
+static uint64_t r2p(bool cc, int byte, int a, uint32_t mask) {
+    return 0x38f0000000000000ull | (uint64_t)cc << 40 | (uint64_t)byte << 41 | (uint64_t)(mask & 0x7FFFF) << 20 |
+           (uint64_t)a << 8 | PT_GUARD | 0xFFull;
+}
+static uint64_t p2r(bool cc, int byte, int d, int a, uint32_t mask) {
+    return 0x38e8000000000000ull | (uint64_t)cc << 40 | (uint64_t)byte << 41 | (uint64_t)(mask & 0x7FFFF) << 20 |
+           (uint64_t)a << 8 | PT_GUARD | (uint64_t)d;
+}
 static uint64_t ldc(int d, int a, int bank, int off) {
     return 0xef90000000000000ull | PT_GUARD | (uint64_t)d | (uint64_t)a << 8 | (uint64_t)(uint16_t)off << 20 |
            (uint64_t)bank << 36 | 4ull << 48;
@@ -96,6 +105,12 @@ static const Case *cases(int *n) {
     // c3's words hold 0xC0000000 + their offset (the prelude)
     CASE("LDC c[3][r1 - 16]", "r0", 0xC0000020u, mov32i(1, 0x30u), ldc(0, 1, 3, -16));
     CASE("LDC c[3][r1 + 8]", "r0", 0xC0000018u, mov32i(1, 0x10u), ldc(0, 1, 3, 8));
+    // R2P.CC sets the flags Z, S, C from bits 0-2 (#20); P2R.CC reads them back (overflow isn't tracked: bit 3 is 0)
+    CASE("R2P.CC 0xa -> P2R.CC (S)", "r0", 0x2u, mov32i(1, 0xAu), r2p(true, 0, 1, 0xF), p2r(true, 0, 0, 255, 0xF));
+    CASE("R2P.CC 0x5 -> P2R.CC (Z, C)", "r0", 0x5u, mov32i(1, 0x5u), r2p(true, 0, 1, 0xF), p2r(true, 0, 0, 255, 0xF));
+    CASE("R2P.CC byte 1, 0x300 -> P2R.CC (Z, S)", "r0", 0x3u, mov32i(1, 0x300u), r2p(true, 1, 1, 0xF), p2r(true, 0, 0, 255, 0xF));
+    CASE("R2P.CC mask 1, 0xf -> P2R.CC (Z only)", "r0", 0x1u, mov32i(1, 0xFu), r2p(true, 0, 1, 0x1), p2r(true, 0, 0, 255, 0xF));
+    CASE("R2P 0x5 -> P2R (p0, p2)", "r0", 0x5u, mov32i(1, 0x5u), r2p(false, 0, 1, 0x7F), p2r(false, 0, 0, 255, 0x7F));
 #undef CASE
     *n = k;
     return c;

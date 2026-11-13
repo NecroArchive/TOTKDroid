@@ -565,6 +565,11 @@ static void create_device(void) {
         has_ext(ep, ne, VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME) ? "yes" : "no",
         has_ext(ep, ne, VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME) ? "yes" : "no",
         has_ext(ep, ne, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME) ? "yes" : "no");
+#ifdef TOTK_LSFG
+    // (frame generation's shaders bind null descriptors: framegen.c, lsfg/ - before the placed maps' two, dropped by count)
+    bool robust2 = has_ext(ep, ne, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
+    if (robust2) ext[n_ext++] = VK_EXT_ROBUSTNESS_2_EXTENSION_NAME;
+#endif
     // the guest heap as GPU memory mapped at its own address (exec.c vk_heap_place; Turnip has it)
     g_vk.map_placed = has_ext(ep, ne, VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME) && has_ext(ep, ne, VK_KHR_MAP_MEMORY_2_EXTENSION_NAME);
     if (g_vk.map_placed) {
@@ -679,6 +684,30 @@ static void create_device(void) {
         LOG("[vk-cap] storage range %llu MB, storage offset alignment %llu, memory types%s\n",
             (unsigned long long)(g_vk.props.limits.maxStorageBufferRange >> 20),
             (unsigned long long)g_vk.props.limits.minStorageBufferOffsetAlignment, types);
+    }
+    {   // The stages whose shaders may use subgroup operations (the translator's VOTE, SHFL and lane ids: maxwell/
+        // translate.c maxwell_subgroup_stages). Turnip on the Adreno 6xx has them in compute only: TOTK's fragment
+        // shaders with a ballot lost the device at its first text (#8, #40, #46 - Adreno 618 / 650; found with the
+        // validation layer by a reporter). LARECOMP_SUBGROUP_STAGES=<STAGE_* bits> (a test): 32 is compute only.
+        VkPhysicalDeviceSubgroupProperties sg = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+        VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &sg};
+        vkGetPhysicalDeviceProperties2(g_vk.phys, &p2);
+        const VkSubgroupFeatureFlags ops = VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_VOTE_BIT |
+                                           VK_SUBGROUP_FEATURE_BALLOT_BIT | VK_SUBGROUP_FEATURE_SHUFFLE_BIT |
+                                           VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT;
+        unsigned stages = 0;
+        if ((sg.supportedOperations & ops) == ops) {
+            if (sg.supportedStages & VK_SHADER_STAGE_FRAGMENT_BIT) stages |= 1u << STAGE_FRAGMENT;
+            if (sg.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) stages |= 1u << STAGE_COMPUTE;
+            if (sg.supportedStages & VK_SHADER_STAGE_GEOMETRY_BIT) stages |= 1u << STAGE_GEOMETRY;
+            if (sg.supportedStages & VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT) stages |= 1u << STAGE_TESS_CTRL;
+            if (sg.supportedStages & VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT) stages |= 1u << STAGE_TESS_EVAL;
+        }
+        const char *e = getenv("LARECOMP_SUBGROUP_STAGES");
+        g_vk.subgroup_stages = e ? (unsigned)strtoul(e, NULL, 0) : stages;
+        LOG("[vk-cap] subgroups: size %u, stages 0x%x, operations 0x%x - in the translated shaders of stages 0x%x%s\n",
+            sg.subgroupSize, (unsigned)sg.supportedStages, (unsigned)sg.supportedOperations, g_vk.subgroup_stages,
+            g_vk.subgroup_stages & (1u << STAGE_FRAGMENT) ? "" : " (fragment shaders: one lane by itself)");
     }
     const char *missing = vk_missing_backend_feature(&h11, &h12, &h13);
     if (missing) FATAL("%sVulkan driver on %s lacks a feature required by this renderer: %s. " DRIVER_HINT "\n"
@@ -818,6 +847,26 @@ static void create_device(void) {
             n_ext -= 2;  // (the two map extensions were the last added)
         }
     }
+#ifdef TOTK_LSFG
+    // Frame generation (framegen.c; lsfg/, GPL-3.0-or-later): its shaders use 16-bit floats, storage images without a
+    // format and of the extended formats, and null descriptors - on where the driver has them (framegen.c checks them all)
+    VkPhysicalDeviceRobustness2FeaturesEXT r2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
+    {
+        VkPhysicalDeviceRobustness2FeaturesEXT q2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
+        VkPhysicalDeviceFeatures2 q = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &q2};
+        if (robust2) vkGetPhysicalDeviceFeatures2(g_vk.phys, &q);
+        g_vk.null_desc = robust2 && q2.nullDescriptor;
+        if (robust2) {  // (the extension was asked for: its structure with it, nullDescriptor only)
+            r2.nullDescriptor = g_vk.null_desc;
+            r2.pNext = f.pNext;
+            f.pNext = &r2;
+        }
+        f12.shaderFloat16 = e_i8.shaderFloat16 = h12.shaderFloat16;
+        g_vk.shader_float16 = h12.shaderFloat16;
+        b->shaderStorageImageExtendedFormats = h->shaderStorageImageExtendedFormats;
+        b->shaderStorageImageWriteWithoutFormat = h->shaderStorageImageWriteWithoutFormat;
+    }
+#endif
     VkPhysicalDeviceMaintenance5FeaturesKHR m5 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR, .maintenance5 = VK_TRUE};
     if (maintenance5) { m5.pNext = f.pNext; f.pNext = &m5; LOG("[vk-cap] maintenance5 on\n"); }
     VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR pex = {
@@ -1198,6 +1247,10 @@ static void save_window_image(VkCommandBuffer cb, VkSpan *out) {
     image_barrier(cb, g_vk.sc_images[cur_frame.image], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 }
 
+// The window images presented so far, the game's and the generated ones (framegen.c): the overlay's "30 -> 60 FPS"
+static _Atomic uint64_t g_presented_images;
+uint64_t vk_presented_images(void) { return g_presented_images; }
+
 // End rendering into the window image and present it. shot_path: also save the window image as PNG.
 void vk_frame_end(const char *shot_path) {
     if (!cur_frame.ok) return;
@@ -1220,6 +1273,7 @@ void vk_frame_end(const char *shot_path) {
     uint64_t trace_start = vk_timing_trace_on() ? SDL_GetTicksNS() : 0;
 #endif
     VkResult r = vkQueuePresentKHR(g_vk.queue, &pi);
+    if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) g_presented_images++;
 #ifdef __ANDROID__
     if (trace_start) vk_timing_trace_wait(VK_TIMING_PRESENT, SDL_GetTicksNS() - trace_start);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) recreate_swapchain();  // (SUBOPTIMAL: every frame of an unrotated swapchain)
@@ -1276,6 +1330,9 @@ uint64_t vk_frame_counter(void) { return g_frame_counter; }
 static float g_shot_crop[4] = {0, 0, 1, 1};
 static double last_fps_time;
 static NvnTexture *g_last_presented;
+#ifdef __ANDROID__
+static float g_fg_layout[4], g_fg_pv[8];  // (the last game frame's place in the window and crop: its generated frames')
+#endif
 
 const float *vk_shot_crop(void) { return g_shot_crop; }
 
@@ -1328,6 +1385,29 @@ void backend_present(NvnTexture *t) {
 #endif
     static const float black[4] = {0, 0, 0, 1};
     uint64_t t0 = SDL_GetTicksNS();
+#ifdef __ANDROID__
+    // Frame generation (framegen.c, LSFG): the frames between the last game frame and this one, recorded into this
+    // frame's commands now, each shown on its own window image ahead of the game's - drawn as the game's is (the same
+    // layout and upscaling, the overlay as last drawn: menu_render_again) - held for an equal share of the game's frame
+    // interval (FIFO shows each at least a refresh)
+    {
+        extern int vk_fg_frame(TexBackend *b, double *hold, TexBackend *gen[3]);
+        TexBackend *gen[3];
+        double hold = 0;
+        int ng = vk_fg_frame(b, &hold, gen);
+        if (g_fg_layout[2] <= 0 || g_fg_layout[3] <= 0) ng = 0;  // (no game frame placed yet)
+        static uint64_t last_shown;
+        for (int g = 0; g < ng; g++) {
+            if (g && hold > 0) plat_sleep_until_ns(last_shown + (uint64_t)(hold * 1e9));
+            if (!vk_frame_begin(black)) break;
+            vk_present_draw(vk_cmd(), gen[g], g_fg_layout[0], g_fg_layout[1], g_fg_layout[2], g_fg_layout[3], g_fg_pv);
+            menu_render_again((void *)vk_cmd());
+            vk_frame_end(NULL);
+            last_shown = SDL_GetTicksNS();
+        }
+        if (ng && hold > 0) plat_sleep_until_ns(last_shown + (uint64_t)(hold * 1e9));
+    }
+#endif
     bool have = vk_frame_begin(black);
     uint64_t nd = SDL_GetTicksNS() - t0;
     if (nd > 30000000) {
@@ -1385,6 +1465,10 @@ void backend_present(NvnTexture *t) {
         VkCommandBuffer cb = vk_cmd();
         float pv[8] = {renderer_origin_lower_left() ? 1.0f : 0.0f, 0, 0, 0, crop[0], crop[1], crop[2], crop[3]};
         memcpy(g_shot_crop, crop, sizeof crop);
+#ifdef __ANDROID__
+        g_fg_layout[0] = (float)vx, g_fg_layout[1] = (float)vy, g_fg_layout[2] = (float)vw, g_fg_layout[3] = (float)vh;
+        memcpy(g_fg_pv, pv, sizeof pv);  // (the next game frame's generated ones are drawn so: frame generation above)
+#endif
         vk_present_draw(cb, b, (float)vx, (float)vy, (float)vw, (float)vh, pv);
         static long menu_at = -1;
         if (menu_at < 0) menu_at = getenv("LARECOMP_MENU_AT") ? atol(getenv("LARECOMP_MENU_AT")) : 0;

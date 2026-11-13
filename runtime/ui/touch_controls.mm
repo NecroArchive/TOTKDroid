@@ -540,19 +540,41 @@ static SDL_FingerID overlay_finger;
 static bool overlay_dragging;
 static float overlay_dx, overlay_dy;
 
+// A tap that doesn't move it (Swap2-Native's): two within 350 ms switch the overlay full / compact
+static float overlay_down_x, overlay_down_y;
+static bool overlay_moved;
+static uint64_t overlay_last_tap;
+
 static bool overlay_drag(const SDL_Event *e, float x, float y) {  // true: the finger is the overlay's
     if (e->type == SDL_EVENT_FINGER_DOWN) {
         const float *r = g_perf_rect;
         if (overlay_dragging || !g_settings.show_fps || r[2] <= 0 || x < r[0] || x > r[0] + r[2] || y < r[1] || y > r[1] + r[3])
             return false;
         overlay_dragging = true, overlay_finger = e->tfinger.fingerID, overlay_dx = r[0] - x, overlay_dy = r[1] - y;
+        overlay_down_x = x, overlay_down_y = y, overlay_moved = false;
         return true;
     }
     if (!overlay_dragging || e->tfinger.fingerID != overlay_finger) return false;
-    float nx = (x + overlay_dx) / disp_w, ny = (y + overlay_dy) / disp_h;  // (perf_overlay.mm keeps it on the screen)
-    g_settings.overlay_pos[0] = nx < 0 ? 0 : nx > 1 ? 1 : nx;
-    g_settings.overlay_pos[1] = ny < 0 ? 0 : ny > 1 ? 1 : ny;
-    if (e->type == SDL_EVENT_FINGER_UP || e->type == SDL_EVENT_FINGER_CANCELED) overlay_dragging = false, settings_save();
+    float slop = 0.012f * (disp_w > disp_h ? disp_w : disp_h);  // (a finger's wobble on a tap)
+    if (fabsf(x - overlay_down_x) > slop || fabsf(y - overlay_down_y) > slop) overlay_moved = true;
+    if (overlay_moved) {
+        float nx = (x + overlay_dx) / disp_w, ny = (y + overlay_dy) / disp_h;  // (perf_overlay.mm keeps it on the screen)
+        g_settings.overlay_pos[0] = nx < 0 ? 0 : nx > 1 ? 1 : nx;
+        g_settings.overlay_pos[1] = ny < 0 ? 0 : ny > 1 ? 1 : ny;
+    }
+    if (e->type == SDL_EVENT_FINGER_UP || e->type == SDL_EVENT_FINGER_CANCELED) {
+        overlay_dragging = false;
+        if (e->type == SDL_EVENT_FINGER_UP && !overlay_moved) {
+            uint64_t now = SDL_GetTicksNS();
+            if (overlay_last_tap && now - overlay_last_tap < 350000000ull) {
+                g_settings.overlay_style = g_settings.overlay_style == 1 ? 0 : 1;
+                overlay_last_tap = 0;
+            } else {
+                overlay_last_tap = now;
+            }
+        }
+        settings_save();
+    }
     return true;
 }
 

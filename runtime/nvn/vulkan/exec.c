@@ -12,6 +12,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #ifdef __ANDROID__
+#include <errno.h>
 #include <sys/mman.h>
 #endif
 
@@ -188,6 +189,8 @@ static void note_gmem_store(int stage);  // (below: it reads the bound storage b
 #define CQ_QUERIES (CQ_MAX + 2)
 static _Atomic uint64_t gpu_busy_total;  // (GPU ns working, all submissions so far: ADPF's GPU time per frame)
 static double g_pace_gpu_ms;  // (the last presented frame's GPU busy time: LARECOMP_LOG_PACE)
+// The last presented frame's GPU busy time in ms, -1 unknown (the performance overlay: ui/perf_overlay.mm)
+double vk_frame_gpu_ms(void) { return g_pace_gpu_ms > 0 ? g_pace_gpu_ms : -1; }
 #else
 #define CQ_QUERIES CQ_MAX
 #endif
@@ -2829,6 +2832,7 @@ static void translate_program(void *arg) {
     maxwell_gmem_size = HEAP_MAX;
 #ifdef __ANDROID__
     maxwell_no_int64 = !g_vk.shader_int64 || g_settings.shader_int32 || getenv("LARECOMP_VK_INT32") != NULL;
+    maxwell_subgroup_stages = g_vk.subgroup_stages;
     maxwell_gmem_map_all = gcopy_mode || gwin_mode;
     maxwell_gmem_bda = gmem_bda != 0;
     maxwell_gmem_miss_log = gcopy_mode && !getenv("LARECOMP_NO_GMISS");
@@ -4577,6 +4581,80 @@ static uint64_t gmem_tried;  // heap size the import was last attempted for (gme
 
 #ifdef __ANDROID__
 static bool gmem_bda_wanted(uint64_t size);
+
+// ---- the game's memory through a shared file (vk_heap_place, g_settings.heap_file): the kinds tried, in order - an
+// opaque file, a dma-buf, then none: the driver's own map of the memory moved to the heap's address (heap_move_map)
+static const char *heap_kind_name(bool memfd, VkExternalMemoryHandleTypeFlagBits ht) {  // (", ..." for the logs)
+    return !memfd ? "" : !ht ? ", the driver's map moved" : ht == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT ? ", a dma-buf"
+                                                                                                                   : ", an exported file";
+}
+
+// LARECOMP_VK_MEMFD_MOVE=0: never the moved map; 2: only it (a test)
+static bool heap_move_allowed(void) {
+    const char *e = getenv("LARECOMP_VK_MEMFD_MOVE");
+    return !e || atoi(e) != 0;
+}
+
+static VkExternalMemoryHandleTypeFlagBits next_heap_kind(VkExternalMemoryHandleTypeFlagBits ht, bool can_move) {
+    (void)can_move;  // (0 - the moved map - when it is allowed; the caller checks)
+    if (ht == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT && g_vk.mem_dmabuf) return VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+    return 0;
+}
+
+// Whether the driver exports this buffer's memory as ht at all (vkGetPhysicalDeviceExternalBufferProperties), and only
+// as the buffer's own allocation (*dedicated: VkMemoryDedicatedAllocateInfo) - Mali and Samsung's drivers export dma-bufs
+// that way; allocated without it the driver gave no file (#45). Said once per kind.
+static bool heap_export_ok(const VkBufferCreateInfo *bi, VkExternalMemoryHandleTypeFlagBits ht, bool *dedicated) {
+    VkPhysicalDeviceExternalBufferInfo q = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_BUFFER_INFO, .flags = bi->flags,
+                                            .usage = bi->usage, .handleType = ht};
+    VkExternalBufferProperties ep = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_BUFFER_PROPERTIES};
+    vkGetPhysicalDeviceExternalBufferProperties(g_vk.phys, &q, &ep);
+    VkExternalMemoryFeatureFlags f = ep.externalMemoryProperties.externalMemoryFeatures;
+    *dedicated = (f & VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT) != 0;
+    static int said;
+    int bit = ht == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT ? 2 : 1;
+    if (!(said & bit)) {
+        said |= bit;
+        LOG("[vk] game memory through a shared file: %s - exportable %s, dedicated only %s (features 0x%x)\n",
+            heap_kind_name(true, ht) + 2, f & VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT ? "yes" : "no", *dedicated ? "yes" : "no",
+            (unsigned)f);
+    }
+    return (f & VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT) != 0;
+}
+
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
+#ifndef MREMAP_FIXED
+#define MREMAP_FIXED 2
+#endif
+// Without a file: the driver maps the memory where it likes (vkMapMemory), and that mapping is moved to the heap's address
+// by mremap, as placed maps would put it there. The range the driver mapped is taken back at once by an inaccessible
+// placeholder: the driver unmaps it when the memory is freed, and must not unmap what else lands there by then. The
+// moved map stays as long as the heap (a reset remaps the whole window: runtime/main.c). Untried on a Mali yet; the log
+// says how far it got. HEAP_BASE on success, else NULL.
+static void *heap_move_map(VkDeviceMemory mem, uint64_t mapped, uint64_t size) {
+    void *q = NULL;
+    VkResult r = vkMapMemory(g_vk.dev, mem, 0, VK_WHOLE_SIZE, 0, &q);
+    if (r != VK_SUCCESS || !q) {
+        LOG("[vk] game memory through the driver's map: vkMapMemory failed (%d)\n", r);
+        return NULL;
+    }
+    void *p = mremap(q, mapped, size, MREMAP_MAYMOVE | MREMAP_FIXED, (void *)(uintptr_t)HEAP_BASE);
+    if (p != (void *)(uintptr_t)HEAP_BASE) {
+        LOG("[vk] game memory through the driver's map: moving it to %llx failed (errno %d)\n", (unsigned long long)HEAP_BASE,
+            errno);
+        // (the window's pages back whatever happened: with MREMAP_FIXED the kernel unmaps the target before it finds the
+        // map can't move - Turnip's EINVAL left the heap unmapped, and the game's first store there crashed, 2026-11-13)
+        plat_reset_guest(HEAP_BASE, HEAP_BASE + size);
+        vkUnmapMemory(g_vk.dev, mem);
+        return NULL;
+    }
+    void *hold = mmap(q, mapped, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
+    if (hold != q) LOG("[vk] game memory through the driver's map: its old range %p not held (errno %d)\n", q, errno);
+    LOG("[vk] game memory through the driver's map: moved from %p to %llx\n", q, (unsigned long long)HEAP_BASE);
+    return p;
+}
 static bool gaddr_write(uint64_t a);
 
 // Turnip (VK_EXT_map_memory_placed): the guest heap *is* GPU memory. When the game sets its heap size (kernel.c
@@ -4659,15 +4737,26 @@ bool vk_heap_place(uint64_t size) {
     VkPhysicalDeviceMemoryProperties mp;
     vkGetPhysicalDeviceMemoryProperties(g_vk.phys, &mp);
     // The exported file's kind: opaque first, a dma-buf where the opaque one takes no host-visible coherent memory (the
-    // Xclipse 530's driver, #234) - or first with LARECOMP_VK_MEMFD_DMABUF=1 (a test)
+    // Xclipse 530's driver, #234) - or first with LARECOMP_VK_MEMFD_DMABUF=1 (a test). Last, no file at all (ht 0): the
+    // driver's own map of the memory moved to the heap's address (heap_move_map) - the Mali-G615's driver refused the
+    // opaque file's buffer and gave no file for a dma-buf (#45: "failed at no file for it"), and the setting did nothing.
     VkExternalMemoryHandleTypeFlagBits ht = memfd && g_vk.mem_dmabuf && getenv("LARECOMP_VK_MEMFD_DMABUF")
                                                 ? VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT : VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+    const bool can_move = memfd && heap_move_allowed();
+    if (memfd && getenv("LARECOMP_VK_MEMFD_MOVE") && atoi(getenv("LARECOMP_VK_MEMFD_MOVE")) == 2) ht = 0;  // (a test: only the move)
     VkBuffer buf;
     VkMemoryRequirements mr;
     int type;
+    bool dedicated = false;  // (the driver exports this kind of memory only as a buffer's own allocation)
     const VkMemoryPropertyFlags need = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
     for (;;) {
         ebi.handleTypes = ht;
+        bi.pNext = memfd && ht ? &ebi : NULL;
+        if (memfd && ht && !heap_export_ok(&bi, ht, &dedicated)) {  // (the driver says it can't export it: the next kind)
+            ht = next_heap_kind(ht, can_move);
+            if (ht || can_move) continue;
+            return NOT_PLACED();
+        }
         VkResult cr = vkCreateBuffer(g_vk.dev, &bi, NULL, &buf);
         if (cr != VK_SUCCESS) {
             // Said, not silent: on the Mali-G720 / G78 / G68 the setting was on and the heap went back to CPU copies
@@ -4678,12 +4767,11 @@ bool vk_heap_place(uint64_t size) {
             VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &m3};
             vkGetPhysicalDeviceProperties2(g_vk.phys, &p2);
             LOG("[vk] heap placement: the %llu MB buffer refused (%d%s; the driver's largest buffer %llu MB, allocation "
-                "%llu MB)\n", (unsigned long long)(size >> 20), cr,
-                !memfd ? "" : ht == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT ? ", a dma-buf" : ", an exported file",
+                "%llu MB)\n", (unsigned long long)(size >> 20), cr, heap_kind_name(memfd, ht),
                 (unsigned long long)(m4.maxBufferSize >> 20), (unsigned long long)(m3.maxMemoryAllocationSize >> 20));
-            if (memfd && g_vk.mem_dmabuf && ht != VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) {
-                ht = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
-                continue;
+            if (memfd && ht) {
+                ht = next_heap_kind(ht, can_move);
+                if (ht || can_move) continue;
             }
             return NOT_PLACED();
         }
@@ -4695,11 +4783,13 @@ bool vk_heap_place(uint64_t size) {
             if (type < 0 || (f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) type = (int)i;
             if (f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) break;
         }
-        if (type >= 0 || !memfd || !g_vk.mem_dmabuf || ht == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) break;
-        LOG("[vk] game memory through a shared file: the opaque file takes memory types 0x%x, none the CPU can use - "
-            "trying a dma-buf\n", mr.memoryTypeBits);
+        if (type >= 0 || !memfd || !ht) break;
+        VkExternalMemoryHandleTypeFlagBits next = next_heap_kind(ht, can_move);
+        if (!next && !can_move) break;
+        LOG("[vk] game memory through a shared file: %s takes memory types 0x%x, none the CPU can use - trying %s\n",
+            heap_kind_name(memfd, ht) + 2, mr.memoryTypeBits, heap_kind_name(memfd, next) + 2);
         vkDestroyBuffer(g_vk.dev, buf, NULL);
-        ht = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+        ht = next;
     }
     {   // LARECOMP_VK_MEMFD_TYPE=<n> (a test): the exported file's memory type - which one a driver gives a map the CPU
         // runs fast in and the GPU sees, memfd_probe.c tells
@@ -4708,22 +4798,40 @@ bool vk_heap_place(uint64_t size) {
     }
     VkDeviceMemory mem = VK_NULL_HANDLE;
     VkMemoryAllocateFlagsInfo af = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
-    VkExportMemoryAllocateInfo exi = {.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO, .pNext = bda ? &af : NULL,
-                                      .handleTypes = ht};
-    VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = memfd ? (void *)&exi : bda ? (void *)&af : NULL,
+    VkMemoryDedicatedAllocateInfo ded = {.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, .pNext = bda ? &af : NULL,
+                                         .buffer = buf};
+    VkExportMemoryAllocateInfo exi = {.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
+                                      .pNext = dedicated ? (void *)&ded : bda ? (void *)&af : NULL, .handleTypes = ht};
+    VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                               .pNext = memfd && ht ? (void *)&exi : bda ? (void *)&af : NULL,
                                .allocationSize = mr.size, .memoryTypeIndex = (uint32_t)type};
     VkResult r = type < 0 ? VK_ERROR_FEATURE_NOT_PRESENT : vkAllocateMemory(g_vk.dev, &ai, NULL, &mem);
     if (r == VK_SUCCESS) r = vkBindBufferMemory(g_vk.dev, buf, mem, 0);
     void *p = NULL;
-    if (r == VK_SUCCESS && memfd) {  // (the file mapped over the heap's anonymous pages; the map keeps it open)
+    if (r == VK_SUCCESS && memfd && ht) {  // (the file mapped over the heap's anonymous pages; the map keeps it open)
         int fd = -1;
         VkMemoryGetFdInfoKHR gi = {.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR, .memory = mem, .handleType = ht};
         r = vkGetMemoryFdKHR(g_vk.dev, &gi, &fd);
-        if (r == VK_SUCCESS) {
+        if (r != VK_SUCCESS || fd < 0) {
+            LOG("[vk] game memory through a shared file: the driver gave no file for%s (%d%s)\n", heap_kind_name(memfd, ht) + 1,
+                r, dedicated ? ", a dedicated allocation" : "");
+            r = VK_ERROR_MEMORY_MAP_FAILED;
+        } else {
             p = mmap((void *)(uintptr_t)HEAP_BASE, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
-            if (p == MAP_FAILED) p = NULL, r = VK_ERROR_MEMORY_MAP_FAILED;
+            if (p == MAP_FAILED) {
+                LOG("[vk] game memory through a shared file: mmap of%s failed (errno %d)\n", heap_kind_name(memfd, ht) + 1, errno);
+                p = NULL, r = VK_ERROR_MEMORY_MAP_FAILED;
+            }
             close(fd);
         }
+        if (!p && can_move) {  // (the same memory, through the driver's own map moved there)
+            p = heap_move_map(mem, mr.size, size);
+            r = p ? VK_SUCCESS : VK_ERROR_MEMORY_MAP_FAILED;
+            if (p) ht = 0;
+        }
+    } else if (r == VK_SUCCESS && memfd) {  // (no file: the driver's own map moved there)
+        p = heap_move_map(mem, mr.size, size);
+        r = p ? VK_SUCCESS : VK_ERROR_MEMORY_MAP_FAILED;
     } else if (r == VK_SUCCESS) {
         VkMemoryMapPlacedInfoEXT pl = {.sType = VK_STRUCTURE_TYPE_MEMORY_MAP_PLACED_INFO_EXT, .pPlacedAddress = (void *)(uintptr_t)HEAP_BASE};
         VkMemoryMapInfoKHR mi = {.sType = VK_STRUCTURE_TYPE_MEMORY_MAP_INFO_KHR, .pNext = &pl, .flags = VK_MEMORY_MAP_PLACED_BIT_EXT,
@@ -4734,7 +4842,7 @@ bool vk_heap_place(uint64_t size) {
         // (memory types the buffer takes: with an exported file on an Xclipse 530 none of them was host-visible and
         // coherent, -8, #234)
         LOG("[vk] heap placement failed (%d, mapped at %p, type %d, the buffer's memory types 0x%x%s): shader global memory "
-            "through CPU copies\n", r, p, type, mr.memoryTypeBits, memfd ? ht == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT ? ", a dma-buf" : ", an exported file" : "");
+            "through CPU copies\n", r, p, type, mr.memoryTypeBits, heap_kind_name(memfd, ht));
         vkDestroyBuffer(g_vk.dev, buf, NULL);
         if (mem) vkFreeMemory(g_vk.dev, mem, NULL);  // destroy the bound buffer first; freeing a placed map unmaps it
         if (p == (void *)(uintptr_t)HEAP_BASE) plat_reset_guest(HEAP_BASE, HEAP_BASE + size);
@@ -4755,7 +4863,7 @@ bool vk_heap_place(uint64_t size) {
     // which reaches only the storage buffers bound to the draw; by pointer every access reaches the whole heap)
     gwin_mode = !gmem_bda && size > g_vk.props.limits.maxStorageBufferRange && !getenv("LARECOMP_VK_NO_GWIN");
     LOG("[vk] guest heap %llu MB is GPU memory (%s at %llx, memory type %d, flags 0x%x): shaders reach it %s "
-        "(storage range %llu MB)\n", (unsigned long long)(size >> 20), !memfd ? "placed" : ht == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT ? "a dma-buf mapped" : "an exported file mapped",
+        "(storage range %llu MB)\n", (unsigned long long)(size >> 20), !memfd ? "placed" : !ht ? "the driver's map moved" : ht == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT ? "a dma-buf mapped" : "an exported file mapped",
         (unsigned long long)HEAP_BASE, type,
         (unsigned)mp.memoryTypes[type].propertyFlags,
         gmem_bda ? "by pointer" : gwin_mode ? "through windows of a storage buffer" : "through a storage buffer",
@@ -6329,6 +6437,7 @@ static CsProg *compute_program(NvnProgram *np) {
     maxwell_gmem_size = HEAP_MAX;
 #ifdef __ANDROID__
     maxwell_no_int64 = !g_vk.shader_int64 || g_settings.shader_int32 || getenv("LARECOMP_VK_INT32") != NULL;
+    maxwell_subgroup_stages = g_vk.subgroup_stages;
     maxwell_gmem_map_all = gcopy_mode || gwin_mode;
     maxwell_gmem_bda = gmem_bda != 0;
     maxwell_gmem_miss_log = gcopy_mode && !getenv("LARECOMP_NO_GMISS");

@@ -26,6 +26,7 @@ uint64_t maxwell_gmem_base, maxwell_gmem_size;
 bool maxwell_gmem_map_all;
 bool maxwell_gmem_bda;
 bool maxwell_no_int64;
+unsigned maxwell_subgroup_stages = ~0u;
 bool maxwell_gmem_miss_log;
 unsigned maxwell_gmem_miss_stages = ~0u;
 #define GMISS_ON(st) (maxwell_gmem_miss_log && (maxwell_gmem_miss_stages >> (st) & 1u))
@@ -106,6 +107,12 @@ typedef struct {
     bool lmem_dynamic;          // an LDL / STL at a register's address
     uint32_t lmem_sph_bytes;    // the SPH's local memory size (graphics stages; 0: none given)
 } Ctx;
+
+// Whether this shader's VOTE / SHFL / lane ids use the subgroup (a warp of lanes) or each invocation is one lane by
+// itself: GLSL stages other than the vertex one, where the driver has subgroup operations (maxwell_subgroup_stages)
+static bool has_lanes(const Ctx *c) {
+    return c->glsl && c->stage != STAGE_VERTEX && (maxwell_subgroup_stages >> c->stage & 1u);
+}
 
 // The local memory array's size in words, a power of two (its index is masked to it: lmask_). Every invocation zeroes
 // it, and an array that big lives in scratch memory: TOTK's material shaders spill one register (STL / LDL [0x0]) and
@@ -1935,7 +1942,7 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         // shaders), each 32 lanes of the subgroup are one (Adreno's is 64 or 128 wide); elsewhere one lane by itself -
         // lane 0, its own bit (the masks were 0: a leader picked by ballot & EQMASK never counted)
         case 0x00: case 0x38: case 0x39: case 0x3a: case 0x3b: case 0x3c: {
-            bool lanes = c->glsl && c->stage != STAGE_VERTEX;
+            bool lanes = has_lanes(c);
             static const char *const one[] = {"0u", "1u", "0u", "1u", "0xFFFFFFFEu", "0xFFFFFFFFu"};
             static const char *const many[] = {"(gl_SubgroupInvocationID & 31u)", "(1u << (gl_SubgroupInvocationID & 31u))",
                                                "((1u << (gl_SubgroupInvocationID & 31u)) - 1u)",
@@ -2212,7 +2219,7 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         // and the MSL path: one lane by itself (TOTK's visibility counter: each passing vertex counts itself, the
         // reduction MacNativeGames lowers it to).
         int pa = (int)bits(w, 39, 3), pb = (int)bits(w, 45, 3), mode = (int)bits(w, 48, 2);
-        bool lanes = c->glsl && c->stage != STAGE_VERTEX;
+        bool lanes = has_lanes(c);
         static const char *const fn[] = {"subgroupAll", "subgroupAny", "subgroupAllEqual", "subgroupAll"};
         if (lanes) c->uses_vote = true;
         sp(&c->body, "    { bool vp_ = %s;\n", P(pa, bits(w, 42, 1)));
@@ -2400,8 +2407,8 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         char bb[32];
         const char *bv = bits(w, 28, 1) ? (sprintf(bb, "%uu", (unsigned)bits(w, 20, 5)), bb) : R((int)bits(w, 20, 8));
         int pd = (int)bits(w, 48, 3);
-        if (c->stage == STAGE_VERTEX) {
-            set_reg(c, d, R(a));  // no SIMD-group functions in vertex functions: lane-local value
+        if (c->stage == STAGE_VERTEX || (c->glsl && !has_lanes(c))) {
+            set_reg(c, d, R(a));  // no SIMD-group functions in vertex functions (or the driver's stage: has_lanes): lane-local value
         } else if (c->glsl) {  // a quad xor (lane mask < 4) is the subgroup xor within the quad
             static const char *const fn[] = {"subgroupShuffle", "subgroupShuffleUp", "subgroupShuffleDown", "subgroupShuffleXor"};
             sprintf(t, "%s(%s, uint(%s))", fn[mode], R(a), bv);
@@ -2418,9 +2425,15 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         if (pd != PT) { c->pred_used[pd] = 1; sp(&c->body, "    p%d = true;\n", pd); }
     } else if (OPM(0x38f0000000000000ull, 0xfef8000000000000ull) || OPM(0x5cf0000000000000ull, 0xfff8000000000000ull) ||
                OPM(0x4cf0000000000000ull, 0xfff8000000000000ull)) {  // R2P
-        if (bits(w, 40, 1)) { fail(c, "r2p cc"); }
         int shift = (int)bits(w, 41, 2) * 8;
         const char *mask = B(false);
+        if (bits(w, 40, 1)) {  // .CC: bits 0-3 into the flags Z, S, C, O, as P2R.CC reads them (overflow isn't tracked)
+            c->uses_cc = true;  // (#20: a Mali-G57's log, "FS translate failed: r2p cc")
+            sp(&c->body, "    { uint rm = %s, rv = %s >> %du;\n", mask, R(a), shift);
+            sp(&c->body, "      if ((rm & 1u) != 0u) ccz = (rv & 1u) != 0u;\n");
+            sp(&c->body, "      if ((rm & 2u) != 0u) ccs = (rv & 2u) != 0u;\n");
+            sp(&c->body, "      if ((rm & 4u) != 0u) cc = (cc & ~1u) | ((rv >> 2) & 1u); }\n");
+        } else
         for (int i = 0; i < 7; i++) {
             c->pred_used[i] = 1;
             sp(&c->body, c->glsl ? "    if (((%s >> %du) & 1u) != 0u) p%d = ((%s >> %du) & 1u) != 0u;\n"

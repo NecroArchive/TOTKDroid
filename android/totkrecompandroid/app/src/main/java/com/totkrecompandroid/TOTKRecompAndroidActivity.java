@@ -77,6 +77,7 @@ public class TOTKRecompAndroidActivity extends SDLActivity {
     private static native boolean nativeCheckRomfs(int version, String[] paths, String versionTxt);
     private static native boolean nativeCheckRomfsImage(int version, int fd);  // (fd: closed by the native side)
     private static native boolean nativeCheckRomfsDir(int version, String dir);  // (a romfs/ used in place, by its path)
+    private static native String nativeBuildRomfsDir(String dir);  // (Copy them, by its path: copyByPath)
     private static native String nativeImageLoose(int fd);
     private static native void nativeDriverPicked(String name);
     private static native void nativeModImportDone(String message);
@@ -752,9 +753,21 @@ public class TOTKRecompAndroidActivity extends SDLActivity {
     // PC from the same files), used instead of building it on the phone when it's for this version and this app
     private Doc preLib, preId, preGame;
 
+    // What find() saw, folder by folder: the cause under "No game files found" and in the log (#25: no log, no clue)
+    private final StringBuilder searched = new StringBuilder();
+    private int searchedDirs;
+
     private void find(Uri tree, Doc dir, int depth) {
         if (depth > 4 || (exefs != null && (romfs != null || romfsImage != null))) return;
         List<Doc> kids = children(tree, dir.id);
+        if (searchedDirs++ < 24) {
+            String seen = (named(kids, "main") != null ? " main" : "") + (named(kids, "main.npdm") != null ? " main.npdm" : "") +
+                    (named(kids, "Pack") != null ? " Pack/" : "") + (named(kids, "Mals") != null ? " Mals/" : "") +
+                    (named(kids, "romfs.bin") != null ? " romfs.bin" : "") + (named(kids, "exefs") != null ? " exefs/" : "") +
+                    (named(kids, "romfs") != null ? " romfs/" : "");
+            searched.append(searched.length() > 0 ? "; " : "").append(depth == 0 ? "(picked)" : dir.name)
+                    .append(": ").append(kids.size()).append(" items").append(seen);
+        }
         if (preLib == null && named(kids, "totkgame.so") != null && named(kids, "totkgame.so.id") != null &&
             named(kids, "totkgame.so.game") != null) {
             preLib = named(kids, "totkgame.so");
@@ -889,11 +902,18 @@ public class TOTKRecompAndroidActivity extends SDLActivity {
             preLib = preId = preGame = null;
             listedTwice = 0;
             packages = false;
+            searched.setLength(0);
+            searchedDirs = 0;
             Doc root = new Doc();
             root.id = DocumentsContract.getTreeDocumentId(tree);
             root.dir = true;
             find(tree, root, 0);
             if (exefs == null || (romfs == null && romfsImage == null)) {
+                String what = (exefs == null ? "no folder with main and main.npdm" : "exefs/ found") + ", " +
+                        (romfs == null && romfsImage == null ? "no folder with Pack/ and Mals/ nor a romfs.bin" : "romfs found") +
+                        " - looked in " + searched + (searchedDirs > 24 ? "; ..." : "");
+                Log.w(TAG, "game files: " + what);
+                nativeImportDetail(what);
                 nativeImportDone(packages ? 3 : 2);
                 return;
             }
@@ -916,6 +936,7 @@ public class TOTKRecompAndroidActivity extends SDLActivity {
                 importInPlace(tree, version);
                 return;
             }
+            if (copyByPath(tree, version)) return;
             // (listed before nativeImportBegin removes an earlier setup: a folder that can't be used leaves it alone)
             romfsTree = tree;
             romfsFiles.clear();
@@ -1009,6 +1030,40 @@ public class TOTKRecompAndroidActivity extends SDLActivity {
         }
         Log.i(TAG, "game data used in place: " + at);
         nativeImportDone(0);
+    }
+
+    // Copy them, with the access to all files: romfs/ checked, listed and read by its path (nativeCheckRomfsDir,
+    // nativeBuildRomfsDir) instead of through the file provider one file at a time - that sat at "Searching files... 0%"
+    // for hours, and then copied as slowly (#21, #16). False: no such path here (a cloud folder, an SD card's tree
+    // without one, or no access to all files) - the file provider's way follows. Called from importGame's try.
+    private boolean copyByPath(Uri tree, int version) throws IOException {
+        if (android.os.Build.VERSION.SDK_INT >= 30 && !android.os.Environment.isExternalStorageManager()) return false;
+        String at = documentPath(romfs.id);
+        if (at == null || !new File(at, "System/RegionLangMask.txt").canRead()) return false;
+        if (!nativeCheckRomfsDir(version, at)) {  // (before nativeImportBegin removes an earlier setup)
+            nativeImportDone(6);
+            return true;
+        }
+        String name = DocumentsContract.getTreeDocumentId(tree);
+        File games = new File(nativeImportBegin(name.substring(name.lastIndexOf(':') + 1), version));
+        copied = reported = 0;
+        total = treeBytes(tree, exefs);
+        copyTree(tree, exefs, new File(games, "exefs"));
+        if (preLib != null && Integer.toString(version).equals(readText(tree, preGame).trim())) {
+            copyDoc(tree, preId, new File(games, "totkgame.so.id"));
+            copyDoc(tree, preLib, new File(games, "totkgame.so"));
+            Log.i(TAG, "game code from the picked folder: " + preLib.size + " bytes");
+        }
+        nativeImportProgress(copied, total);
+        Log.i(TAG, "game data copied by its path: " + at);
+        String failed = nativeBuildRomfsDir(at);
+        if (failed != null) {
+            Log.e(TAG, "game data image: " + failed);
+            nativeImportDone(5);
+            return true;
+        }
+        nativeImportDone(0);
+        return true;
     }
 
     // The game files from exefs/ and a romfs.bin made already (importGame found them): the image checked from its own

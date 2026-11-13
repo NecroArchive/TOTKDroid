@@ -43,6 +43,14 @@ else()
     list(REMOVE_ITEM RT_SRC ${R}/runtime/hle/movie.c)
 endif()
 file(GLOB VK_SRC CONFIGURE_DEPENDS ${R}/runtime/nvn/vulkan/*.c ${R}/runtime/nvn/vulkan/*.cpp)
+# Lossless Scaling frame generation (runtime/nvn/vulkan/lsfg, ported from Eden through Swap2-Native): GPL-3.0-or-later, so a
+# libmain.so built with it (the default) is GPL-3.0-or-later as a whole (NOTICE.md). -DTOTK_LSFG=OFF (Gradle
+# -PtotkLsfg=false) leaves it out: the rest of TOTKDroid is MIT, and vulkan/framegen.c then reports "not in this build"
+option(TOTK_LSFG "Lossless Scaling frame generation (GPL-3.0-or-later)" ON)
+if(TOTK_LSFG)
+    file(GLOB LSFG_SRC CONFIGURE_DEPENDS ${R}/runtime/nvn/vulkan/lsfg/*.c)
+    list(APPEND VK_SRC ${LSFG_SRC})
+endif()
 file(GLOB UI_SRC CONFIGURE_DEPENDS ${R}/runtime/ui/*.mm)
 set(IMGUI ${R}/third_party/imgui)
 set(IMGUI_SRC ${IMGUI}/imgui.cpp ${IMGUI}/imgui_draw.cpp ${IMGUI}/imgui_tables.cpp ${IMGUI}/imgui_widgets.cpp
@@ -61,7 +69,8 @@ target_include_directories(main PRIVATE ${R}/runtime ${R}/runtime/nvn ${IMGUI} $
                            ${R}/third_party/zstd)
 target_compile_definitions(main PRIVATE
     VK_NO_PROTOTYPES VK_USE_PLATFORM_ANDROID_KHR IMGUI_IMPL_VULKAN_USE_VOLK   # Vulkan from the loaded driver (volk)
-    VMA_STATIC_VULKAN_FUNCTIONS=0 VMA_DYNAMIC_VULKAN_FUNCTIONS=1)
+    VMA_STATIC_VULKAN_FUNCTIONS=0 VMA_DYNAMIC_VULKAN_FUNCTIONS=1
+    $<$<BOOL:${TOTK_LSFG}>:TOTK_LSFG>)
 if(HAVE_FFMPEG)
     target_link_libraries(main PRIVATE avcodec avformat avutil swscale)
 else()

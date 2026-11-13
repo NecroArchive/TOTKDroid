@@ -28,10 +28,15 @@ Settings g_settings = {
     .reverb = true,
     .movie_audio = true,
     .motion = true,
+    .lsfg_mult = 2,
+    .lsfg_flow = 75,
 #ifdef __ANDROID__
     .show_fps = true,  // (the performance overlay, ui/perf_overlay.mm: on until turned off in the menu)
     .touch_controls = true,
     .overlay_pos = {-1, -1},
+    .overlay_scale = 75,
+    .overlay_opacity = 100,
+    .overlay_items = OVERLAY_ALL,
     .touch_pos = {{-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1},
                   {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}},
     .touch_scheme = 1,
@@ -195,12 +200,18 @@ void settings_reset_defaults(void) {
     g_settings.reverb = d->reverb;
     g_settings.movie_audio = d->movie_audio;
     g_settings.show_fps = d->show_fps;
+    g_settings.lsfg = d->lsfg;
+    g_settings.lsfg_mult = d->lsfg_mult;
+    g_settings.lsfg_flow = d->lsfg_flow;
     g_settings.motion = d->motion;
     g_settings.motion_source = d->motion_source;
     g_settings.motion_flat = d->motion_flat;
 #ifdef __ANDROID__
     g_settings.touch_controls = d->touch_controls;
     g_settings.overlay_style = d->overlay_style;
+    g_settings.overlay_scale = d->overlay_scale;
+    g_settings.overlay_opacity = d->overlay_opacity;
+    g_settings.overlay_items = d->overlay_items;
     g_settings.fps_mode = d->fps_mode;
     g_settings.shader_int32 = d->shader_int32;
     g_settings.sync_lag = d->sync_lag;
@@ -237,11 +248,17 @@ void settings_load(void) {
         else if (!strcmp(key, "reverb")) g_settings.reverb = atoi(val) != 0;
         else if (!strcmp(key, "movie_audio")) g_settings.movie_audio = atoi(val) != 0;
         else if (!strcmp(key, "show_fps")) g_settings.show_fps = atoi(val) != 0;
+        else if (!strcmp(key, "lsfg")) g_settings.lsfg = atoi(val) != 0;
+        else if (!strcmp(key, "lsfg_mult")) g_settings.lsfg_mult = atoi(val) < 2 ? 2 : atoi(val) > 4 ? 4 : atoi(val);
+        else if (!strcmp(key, "lsfg_flow")) g_settings.lsfg_flow = atoi(val) <= 0 ? 0 : atoi(val) < 25 ? 25 : atoi(val) > 100 ? 100 : atoi(val);
         else if (!strcmp(key, "motion")) g_settings.motion = atoi(val) != 0;
         else if (!strcmp(key, "motion_source")) g_settings.motion_source = atoi(val) >= 0 && atoi(val) <= 2 ? atoi(val) : 0;
         else if (!strcmp(key, "motion_flat")) g_settings.motion_flat = atoi(val) != 0;
 #ifdef __ANDROID__
         else if (!strcmp(key, "overlay")) g_settings.overlay_style = !strcmp(val, "compact");
+        else if (!strcmp(key, "overlay_scale")) g_settings.overlay_scale = atoi(val);
+        else if (!strcmp(key, "overlay_opacity")) g_settings.overlay_opacity = atoi(val);
+        else if (!strcmp(key, "overlay_items")) g_settings.overlay_items = atoi(val);
         else if (!strcmp(key, "overlay_pos")) sscanf(val, "%f,%f", &g_settings.overlay_pos[0], &g_settings.overlay_pos[1]);
 #endif
 #ifdef __ANDROID__
@@ -345,10 +362,13 @@ void settings_save(void) {
     fprintf(f, "reverb = %d\n", g_settings.reverb);
     fprintf(f, "movie_audio = %d\n", g_settings.movie_audio);
     fprintf(f, "show_fps = %d\n", g_settings.show_fps);
+    fprintf(f, "lsfg = %d\nlsfg_mult = %d\nlsfg_flow = %d\n", g_settings.lsfg, g_settings.lsfg_mult, g_settings.lsfg_flow);
     fprintf(f, "motion = %d\nmotion_source = %d\nmotion_flat = %d\n", g_settings.motion, g_settings.motion_source,
             g_settings.motion_flat);
 #ifdef __ANDROID__
-    fprintf(f, "overlay = %s\n", g_settings.overlay_style == 1 ? "compact" : "full");
+    fprintf(f, "overlay = %s\noverlay_scale = %d\noverlay_opacity = %d\noverlay_items = %d\n",
+            g_settings.overlay_style == 1 ? "compact" : "full", g_settings.overlay_scale, g_settings.overlay_opacity,
+            g_settings.overlay_items);
     fprintf(f, "overlay_pos = %.4f,%.4f\n", g_settings.overlay_pos[0], g_settings.overlay_pos[1]);
 #endif
 #ifdef __ANDROID__
