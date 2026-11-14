@@ -27,6 +27,7 @@ Settings g_settings = {
     .volume = 1.0f,
     .reverb = true,
     .movie_audio = true,
+    .autoplay = true,
     .motion = true,
     .lsfg_mult = 2,
     .lsfg_flow = 75,
@@ -339,6 +340,7 @@ void settings_load(void) {
             for (int i = 1; i < N_LANGUAGES; i++)
                 if (!strcmp(v, g_language_codes[i])) g_settings.language = i;
         }
+        else if (!strcmp(key, "autoplay")) g_settings.autoplay = atoi(val) != 0;
         else if (!strcmp(key, "menu_tip_seen")) g_settings.menu_tip_seen = atoi(val) != 0, tip_key = true;
         else if (!strcmp(key, "mods_off")) snprintf(g_settings.mods_off, sizeof g_settings.mods_off, "%s", val);
         else if (!strcmp(key, "aspect_asked")) g_settings.aspect_asked = atoi(val) != 0, aspect_key = true;
@@ -416,6 +418,7 @@ void settings_save(void) {
                                                      ? g_settings.language : LANG_AUTO]);
     fprintf(f, "aspect_asked = %d\n", g_settings.aspect_asked);
     fprintf(f, "menu_tip_seen = %d\n", g_settings.menu_tip_seen);
+    fprintf(f, "autoplay = %d\n", g_settings.autoplay);
     fprintf(f, "mods_off = %s\n", g_settings.mods_off);
     bind_settings_save(f);
     fclose(f);

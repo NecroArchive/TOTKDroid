@@ -675,3 +675,11 @@
 
 {"40 fps on a 120 Hz display, 45 on 90 Hz, 30 on 60 Hz.",
  "40 fps em tela de 120 Hz, 45 em 90 Hz e 30 em 60 Hz."},
+{"Autoplay",
+ "Início automático"},
+{"Start the game directly",
+ "Entrar direto no jogo"},
+{"Once the game is set up, the start screen plays by itself after a short countdown. Touch the screen or press a button during it to stay on the start screen.",
+ "Com o jogo configurado, a tela inicial começa a jogar sozinha depois de uma contagem curta. Toque na tela ou aperte um botão durante a contagem para ficar na tela inicial."},
+{"Starting the game in %d s - touch the screen to stay here",
+ "Iniciando o jogo em %d s - toque na tela para ficar aqui"},

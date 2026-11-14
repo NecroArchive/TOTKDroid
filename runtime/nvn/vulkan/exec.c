@@ -1735,6 +1735,7 @@ static VmaAllocation wb_mem;
 static uint8_t *wb_ptr;
 static pthread_mutex_t wb_lock = PTHREAD_MUTEX_INITIALIZER;
 static NvnTexture *wb_pass[8];
+static uint32_t wb_pass_lv[8];  // (the level each pass target draws: wb_level_eligible)
 static int wb_npass;
 static uint64_t stat_wb, stat_wb_dropped;
 // The submission of the latest write-back queued: the sync lag's wait covers it (objects.c nvnSyncWait) - the CPU reads
@@ -1773,7 +1774,25 @@ static bool wb_eligible(NvnTexture *t, TexBackend *b, uint32_t lv) {
                                                   lin && (t->flags & 0x50), WB_MAX, WB_SLOT);
 }
 
-static void wb_queue(NvnTexture *t) {
+// Mipmapped targets in CPU-visible pools, every level drawn (each up to a slot): TOTK draws its terrain tiles' normal
+// maps (260x260 RG8, 9 levels, MINIMAL_LAYOUT, in a CPU_CACHED | GPU_CACHED pool) on the GPU, then its resource
+// defragmentation moves each tile with memcpy and makes the texture again at the new address - uploaded from memory
+// that never got the drawn texels, the normals were zero: the grass has no length on a zero normal and the ground lost
+// its lighting (Swap2-Native's docs/reference/nvn-objects.md, "Render passes into textures uploaded from their
+// storage", MIT; the code is ours). LARECOMP_WB_LEVELS=0: off.
+static bool wb_level_eligible(NvnTexture *t, TexBackend *b, uint32_t lv) {
+    static int on = -1;
+    if (on < 0) on = !getenv("LARECOMP_WB_LEVELS") || atoi(getenv("LARECOMP_WB_LEVELS"));
+    if (!on || !wb_on() || !t || !b || !t->pool || !(t->pool->flags & 0x6u) || lv >= t->levels) return false;
+    if (t->depth > 1 || t->layout.layers > 1 || b->samples > 1 || (t->flags & 0x50) || t->addr < HEAP_BASE) return false;
+    if (!(b->aspect & VK_IMAGE_ASPECT_COLOR_BIT) || b->width != t->width || b->height != t->height) return false;
+    const FormatInfo *fi = t->layout.fmt;
+    if (!fi || !fi->bpb || fi->bw != 1 || fi->bh != 1 || fi->bpb == 3) return false;
+    LevelLayout l = tegra_level(&t->layout, lv);
+    return (uint64_t)l.wb * l.hb * fi->bpb <= WB_SLOT;
+}
+
+static void wb_queue(NvnTexture *t, uint32_t lv) {
     TexBackend *b = t->backend;
     pthread_mutex_lock(&wb_lock);
     if (!wb_buf) {
@@ -1788,8 +1807,9 @@ static void wb_queue(NvnTexture *t) {
     }
     // (the slot by the copy's size: a small one when it fits WB_MAX, a big one else)
     const FormatInfo *qfi = t->layout.fmt;
-    LevelLayout ql = tegra_level(&t->layout, 0);  // (wb_apply reads the level's padded blocks: the larger of the two)
-    uint64_t qbpb = qfi ? qfi->bpb : 16, need = (uint64_t)t->width * t->height * qbpb, padded = (uint64_t)ql.wb * ql.hb * qbpb;
+    LevelLayout ql = tegra_level(&t->layout, lv);  // (wb_apply reads the level's padded blocks: the larger of the two)
+    uint32_t lvw = t->width >> lv ? t->width >> lv : 1, lvh = t->height >> lv ? t->height >> lv : 1;
+    uint64_t qbpb = qfi ? qfi->bpb : 16, need = (uint64_t)lvw * lvh * qbpb, padded = (uint64_t)ql.wb * ql.hb * qbpb;
     bool small = (need > padded ? need : padded) <= WB_MAX;
     int *next = small ? &wb_next_small : &wb_next_big;
     int base = small ? 0 : WB_SMALL, count = small ? WB_SMALL : WB_BIG;
@@ -1822,9 +1842,9 @@ static void wb_queue(NvnTexture *t) {
     *next = (*next + 1) % count;
     uint64_t off = small ? (uint64_t)slot * WB_MAX : (uint64_t)WB_MAX * WB_SMALL + (uint64_t)slot * WB_SLOT;
     const FormatInfo *fi = t->layout.fmt;
-    LevelLayout l = tegra_level(&t->layout, 0);
+    LevelLayout l = tegra_level(&t->layout, lv);
     extern uint64_t nvn_linear_rt_pitch(uint64_t row_bytes);
-    *e = (WbEntry){.seq = submit_seq + 1, .addr = t->addr, .wb = l.wb, .hb = l.hb, .bpb = fi->bpb,
+    *e = (WbEntry){.seq = submit_seq + 1, .addr = t->addr + l.offset, .wb = l.wb, .hb = l.hb, .bpb = fi->bpb,
                    .pitch = (t->flags & 0x10) ? t->stride : (t->flags & 0x40) ? nvn_linear_rt_pitch((uint64_t)l.wb * fi->bpb) : 0,
                    .bh = l.block_height_log2, .fmt = t->format, .off = off, .size = small ? WB_MAX : WB_SLOT,
                    .order = ++wb_order, .busy = true};
@@ -1842,8 +1862,8 @@ static void wb_queue(NvnTexture *t) {
     }
     VkCommandBuffer cb = vk_cmd();
     vk_full_barrier(cb);
-    VkBufferImageCopy c = {.bufferOffset = (VkDeviceSize)off, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-                           .imageExtent = {t->width, t->height, 1}};
+    VkBufferImageCopy c = {.bufferOffset = (VkDeviceSize)off, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, lv, 0, 1},
+                           .imageExtent = {lvw, lvh, 1}};
     vkCmdCopyImageToBuffer(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, wb_buf, 1, &c);
     VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
                            .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT,
@@ -2027,7 +2047,7 @@ static void vk_end_pass_at(int line) {
             dump_layers_raw((TexBackend *)g_pass_t0->backend);
         }
     }
-    for (int i = 0; i < wb_npass; i++) wb_queue(wb_pass[i]);
+    for (int i = 0; i < wb_npass; i++) wb_queue(wb_pass[i], wb_pass_lv[i]);
     wb_npass = 0;
     {   // (diagnosis) LARECOMP_DEBUG_WAIT_PASSES=<first>-<last>: in debug frames, the GPU finishes the work so far
         // after each of those passes (numbered from 0 each frame) - what the pass dumps do, without the dumps
@@ -2229,8 +2249,28 @@ static void begin_pass(void) {
             ca[i].clearValue.color.float32[3] = fresh ? 0.0f : 1.0f;
         }
         pass_color[i] = vf;
-        if (wb_eligible(t, b, lv) && !(st.rt.has_cview[i] && ((st.rt.cview[i].setmask & ~3u) || st.rt.cview[i].min_layer)))
-            wb_pass[wb_npass++] = t;  // (a view of its level 0 / layer 0 only)
+        bool wb_view_ok = !(st.rt.has_cview[i] && ((st.rt.cview[i].setmask & ~3u) || st.rt.cview[i].min_layer));
+        if ((wb_eligible(t, b, lv) || wb_level_eligible(t, b, lv)) && wb_view_ok)
+            wb_pass_lv[wb_npass] = lv, wb_pass[wb_npass++] = t;  // (a view of one level, layer 0)
+        else if (t->pool && (t->pool->flags & 0x6u) && getenv("LARECOMP_LOG_WB_MISS")) {
+            // (diagnosis) LARECOMP_LOG_WB_MISS=1: targets in CPU-visible pools whose texels are not written back to memory
+            // (each shape once, with why) - the CPU may read them, or move them with memcpy as TOTK's terrain tiles
+            static uint64_t seen[512];
+            static int nseen;
+            uint64_t key = ((uint64_t)t->width << 48) ^ ((uint64_t)t->height << 32) ^ ((uint64_t)t->format << 20) ^
+                           ((uint64_t)t->levels << 12) ^ ((uint64_t)t->layout.layers << 4) ^ t->depth ^ ((uint64_t)t->flags << 56);
+            bool fresh = true;
+            for (int k = 0; k < nseen; k++) if (seen[k] == key) { fresh = false; break; }
+            if (fresh && nseen < 512) {
+                seen[nseen++] = key;
+                const FormatInfo *fi = t->layout.fmt;
+                LOG("[wb-miss] %ux%u x%u layers %u lv %u/%u fmt %#x (%s) flags %#x pool %#x at %llx: %s%s%s%s%s\n", t->width, t->height,
+                    t->depth, t->layout.layers, lv, t->levels, t->format, fi && fi->bw > 1 ? "compressed" : "plain", t->flags,
+                    t->pool->flags, (unsigned long long)t->addr, wb_view_ok ? "" : "view ", t->layout.layers > 1 || t->depth > 1 ? "layers/3d " : "",
+                    (t->flags & 0x50) ? "linear " : "", b->width != t->width || b->height != t->height ? "scaled " : "",
+                    bc_shadow ? "bc-shadow" : "");
+            }
+        }
         if (!w) { renderer_texture_scale(t, &pass_sx, &pass_sy); w = ew; }
         if (ew < minw) minw = ew;
         if (eh < minh) minh = eh;

@@ -1479,6 +1479,14 @@ static void prelaunch_tab(float sc) {
         ImGui::Separator();
         ImGui::Spacing();
     };
+    heading("Autoplay");
+    if (ImGui::Checkbox(tr("Start the game directly"), &g_settings.autoplay)) settings_save();
+    ImGui::PushTextWrapPos(0);
+    ImGui::TextDisabled("%s", tr("Once the game is set up, the start screen plays by itself after a short countdown. Touch "
+                                 "the screen or press a button during it to stay on the start screen."));
+    ImGui::PopTextWrapPos();
+    ImGui::Spacing();
+    ImGui::Spacing();
 #ifdef __ANDROID__
     heading("Vulkan driver");
     {
@@ -1833,6 +1841,13 @@ extern "C" void launcher_run(const char *root) {
     static int runs;  // (test: =once - only the first time, so a "Title screen" reboot lands on the start screen)
     const char *ap = getenv("LARECOMP_LAUNCHER_AUTOPLAY");
     if (ap && status.empty() && !(runs && !strcmp(ap, "once"))) play = true;  // (test: PLAY at once)
+    // Autoplay (settings.autoplay, Settings > Prelaunch): once the game is set up and the first PLAY's questions were
+    // answered, PLAY by itself after a short countdown; a touch, click, key or button during it stays here (the way to
+    // the settings). Only the first start screen of a run: one reached from the game stays.
+    uint64_t autoplay_until = 0;
+    if (g_settings.autoplay && status.empty() && !runs && g_settings.aspect_asked && g_settings.menu_tip_seen && !shot_at &&
+        !getenv("LARECOMP_LAUNCHER_SETUP") && !getenv("LARECOMP_LAUNCHER_DELETE"))
+        autoplay_until = SDL_GetTicks() + 3000;
     runs++;
     if (const char *t = getenv("LARECOMP_LAUNCHER_EXTRACT")) {  // (test) <folder>: set the game files up, log, exit
         g_src = t;
@@ -1878,6 +1893,9 @@ extern "C" void launcher_run(const char *root) {
 #endif
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
+            if (autoplay_until && (e.type == SDL_EVENT_FINGER_DOWN || e.type == SDL_EVENT_MOUSE_BUTTON_DOWN ||
+                                   e.type == SDL_EVENT_KEY_DOWN || e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN))
+                autoplay_until = 0;  // (the player is here: no autoplay)
             if (page == SETTINGS && bind_capture_event(&e)) continue;  // (waiting for a new binding: controls_ui.mm)
             if (!launcher_pad_event(e)) ImGui_ImplSDL3_ProcessEvent(&e);
             if (e.type == SDL_EVENT_QUIT) exit(0);
@@ -1903,6 +1921,12 @@ extern "C" void launcher_run(const char *root) {
             if (status.empty() && !g_switching_to && !failed) { load_background(dev); page = MAIN; }
         }
         was_busy = busy;
+        if (autoplay_until && (page != MAIN || busy || !status.empty())) autoplay_until = 0;
+        if (autoplay_until && SDL_GetTicks() >= autoplay_until) {
+            autoplay_until = 0;
+            fprintf(stderr, "[launcher] autoplay\n");
+            play = true;
+        }
 
 #ifdef __APPLE__
         int w, h;
@@ -2048,6 +2072,21 @@ extern "C" void launcher_run(const char *root) {
                 ImGui::SetCursorPosX(x0);
                 if (menu_item("QUIT", true)) exit(0);
                 g_menu_gap = 0.35f;
+                if (autoplay_until) {  // (the countdown, at the bottom: a touch stays here)
+                    uint64_t now = SDL_GetTicks();
+                    int left = autoplay_until > now ? (int)((autoplay_until - now + 999) / 1000) : 0;
+                    char msg[256];
+                    snprintf(msg, sizeof msg, tr("Starting the game in %d s - touch the screen to stay here"), left);
+                    ImGui::PushFont(g_font_menu);
+                    ImVec2 ts = ImGui::CalcTextSize(msg);
+                    ImGui::PopFont();
+                    ImDrawList *fg = ImGui::GetForegroundDrawList();
+                    ImVec2 dsz = ImGui::GetIO().DisplaySize;
+                    float pad = 14 * s, x = (dsz.x - ts.x) * 0.5f, y = dsz.y - ts.y - 48 * s;
+                    fg->AddRectFilled(ImVec2(x - pad, y - pad * 0.6f), ImVec2(x + ts.x + pad, y + ts.y + pad * 0.6f),
+                                      IM_COL32(0, 0, 0, 160), 10 * s);
+                    fg->AddText(g_font_menu, g_font_menu->FontSize, ImVec2(x, y), IM_COL32(236, 194, 84, 255), msg);
+                }
             } else if (page == SETTINGS) {
                 // the in-game menu's tabs (runtime/ui/menu.mm), in a window like the in-game one; tabs that need a
                 // loaded game say so

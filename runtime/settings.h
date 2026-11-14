@@ -92,6 +92,8 @@ typedef struct {
     int language;        // LANG_AUTO or an index into g_language_codes: the game's text language
     bool aspect_asked;   // the start screen's one-time "authentic 16:9 or unlocked?" question was answered
     bool menu_tip_seen;  // the start screen's one-time "how to open the menu" note was shown (first PLAY ever)
+    bool autoplay;       // the start screen plays by itself after a short countdown once the game is set up (a touch or
+                         // a key during it stays on the start screen; ui/launcher.mm)
     char mods_off[512];  // game mods turned off (runtime/mods.c: their folder names, separated by '|')
 } Settings;
 

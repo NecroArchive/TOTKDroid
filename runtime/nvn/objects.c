@@ -561,7 +561,7 @@ NVN(nvnBufferInvalidateMappedRange) { (void)c; }
 // ================================================================== textures
 // TextureBuilder: device@0 flags@8 target@0xC width@0x10 height@0x14 depth@0x18 levels@0x1C
 //   format@0x20 samples@0x24 swizzle@0x28 dsmode@0x2C stride@0x30 pool@0x38 offset@0x40
-//   packaged@0x48 layout@0x50 glname@0x58
+//   packaged@0x48 layout@0x50 glname@0x58 layout-given@0x5C (ours)
 #define TB(T, off) G(T, A(0), off)
 NVN(nvnTextureBuilderSetDevice) { TB(uint64_t, 0) = A(1); }
 NVN(nvnTextureBuilderSetDefaults) {
@@ -592,7 +592,10 @@ NVN(nvnTextureBuilderSetDepthStencilMode) { TB(uint32_t, 0x2C) = (uint32_t)A(1);
 NVN(nvnTextureBuilderSetStride) { TB(uint64_t, 0x30) = A(1); }
 NVN(nvnTextureBuilderSetStorage) { TB(uint64_t, 0x38) = A(1); TB(uint64_t, 0x40) = A(2); }
 NVN(nvnTextureBuilderSetPackagedTextureData) { TB(uint64_t, 0x48) = A(1); }
-NVN(nvnTextureBuilderSetPackagedTextureLayout) { TB(uint64_t, 0x50) = A(1) ? *(uint64_t *)AP(1) : 0; }
+NVN(nvnTextureBuilderSetPackagedTextureLayout) {
+    TB(uint64_t, 0x50) = A(1) ? *(uint64_t *)AP(1) : 0;
+    TB(uint32_t, 0x5C) = A(1) != 0;  // (a layout given, even all zero: objects.c builder_layout)
+}
 NVN(nvnTextureBuilderSetGLTextureName) { TB(uint32_t, 0x58) = (uint32_t)A(1); }
 NVN(nvnTextureBuilderGetDevice) { RET(TB(uint64_t, 0)); }
 NVN(nvnTextureBuilderGetFlags) { RET(TB(uint32_t, 8)); }
@@ -654,15 +657,28 @@ static void builder_layout(uint64_t b, TexLayout *t) {
     static int nominimal = -1;
     if (nominimal < 0) nominimal = getenv("LARECOMP_NO_MINIMAL_LAYOUT") != NULL;
     uint64_t pl = G(uint64_t, b, 0x50);
-    if ((G(uint32_t, b, 8) & 0x200) && !pl && !nominimal && (t->block_height_log2 || t->block_depth_log2)) {
+    bool has_pl = pl || G(uint32_t, b, 0x5C);  // (0x5C: SetPackagedTextureLayout was given a layout, even an all-zero one)
+    if ((G(uint32_t, b, 8) & 0x200) && !has_pl && !nominimal && (t->block_height_log2 || t->block_depth_log2)) {
         TexLayout one = *t;
         one.block_height_log2 = one.block_depth_log2 = 0;
         if (tegra_layer_size(&one) != tegra_layer_size(t)) t->block_height_log2 = t->block_depth_log2 = 0;
     }
-    // Packaged textures (BNTX) were swizzled offline with their own block height, which can differ
-    // from the driver default: NVNpackagedTextureLayout's low word is log2(GOBs per block).
-    if (pl && (uint32_t)pl <= 5) t->block_height_log2 = (uint32_t)pl;
-    if (pl && getenv("LARECOMP_LOG_PACKAGED")) {
+    // Packaged textures (BNTX) were swizzled offline with their own block dimensions, which can differ from the driver
+    // default: NVNpackagedTextureLayout's byte 0 holds log2(GOBs per block) in height in its low nibble and in depth in
+    // its high nibble (3D textures); a layout of zero is 1-GOB blocks, not "none" (digitalhivehub's driver probes,
+    // nxnative PR #11, as documented in Swap2-Native's docs/reference/nvn-objects.md, MIT). Before, the whole low word
+    // was taken as the height and only when <= 5: a 3D texture kept the automatic depth, and a layout with other bytes
+    // set was ignored. LARECOMP_OLD_PACKAGED=1: that rule
+    static int oldpkg = -1;
+    if (oldpkg < 0) oldpkg = getenv("LARECOMP_OLD_PACKAGED") != NULL;
+    if (oldpkg) {
+        if (pl && (uint32_t)pl <= 5) t->block_height_log2 = (uint32_t)pl;
+    } else if (has_pl) {
+        uint32_t b0 = (uint32_t)(pl & 0xFF);
+        t->block_height_log2 = (b0 & 0xF) <= 5 ? b0 & 0xF : 5;
+        if (t->depth > 1) t->block_depth_log2 = (b0 >> 4) <= 5 ? b0 >> 4 : 5;
+    }
+    if (has_pl && getenv("LARECOMP_LOG_PACKAGED")) {
         static int n;
         if (n++ < 4000) LOG("[nvn] packaged layout %016llx fmt %#x %ux%u lv %u -> default bh %u\n", pl, G(uint32_t, b, 0x20), t->width, t->height, t->levels, t->block_height_log2);
     }
