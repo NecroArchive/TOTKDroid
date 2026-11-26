@@ -6071,6 +6071,7 @@ bool vk_heap_file_possible(void) { return g_vk.mem_fd; }  // (the start screen's
 // BLOB, and asking it for such sizes again and again restarted its system_server (2026-11-14) - untried on a Mali yet.
 #include <android/hardware_buffer.h>
 int vk_ahb_alloc(uint64_t size, AHardwareBuffer **out, const char **why);
+extern int g_ahb_cpu_rarely;  // (memfd_probe.c vk_ahb_alloc: the CPU use asked of gralloc)
 bool vk_ahb_import(AHardwareBuffer *ahb, uint64_t size, VkBufferUsageFlags usage, bool bda, VkBuffer *pbuf,
                    VkDeviceMemory *pmem, int *ptype, const char **why);
 bool vk_ahb_coherent(uint8_t *p, VkBuffer buf, VkDeviceMemory mem, uint64_t off, VkBufferUsageFlags usage, const char **why);
@@ -6151,8 +6152,18 @@ static bool heap_ahb_blocks(uint64_t size, VkBufferUsageFlags usage) {
         if (k == 0) {
             VkPhysicalDeviceMemoryProperties mp;
             vkGetPhysicalDeviceMemoryProperties(g_vk.phys, &mp);
-            LOG("[vk] game memory in blocks of Android hardware buffers: block 0 coherent, memory type %d (flags 0x%x)\n", type,
-                (unsigned)mp.memoryTypes[type].propertyFlags);
+            // (and how fast the CPU reads and writes it: uncached memory - a CPU used rarely - makes the game's own code slower)
+            volatile uint64_t *q = (volatile uint64_t *)at;
+            uint64_t n8 = (sz < (16u << 20) ? sz : (16u << 20)) / 8, sum = 0, tw = plat_now_ns();
+            for (uint64_t i = 0; i < n8; i++) q[i] = i;
+            uint64_t tr = plat_now_ns();
+            for (uint64_t i = 0; i < n8; i++) sum += q[i];
+            uint64_t te = plat_now_ns();
+            memset((void *)at, 0, n8 * 8);
+            LOG("[vk] game memory in blocks of Android hardware buffers: block 0 coherent, memory type %d (flags 0x%x), CPU %s, "
+                "writes %.1f GB/s, reads %.1f GB/s (%llu)\n", type, (unsigned)mp.memoryTypes[type].propertyFlags,
+                g_ahb_cpu_rarely ? "used rarely" : "used often", n8 * 8 / ((tr - tw) + 1.0), n8 * 8 / ((te - tr) + 1.0),
+                (unsigned long long)(sum & 1));
         }
     }
     if (!why) {
@@ -6169,6 +6180,9 @@ static bool heap_ahb_blocks(uint64_t size, VkBufferUsageFlags usage) {
         hch[j].buf = VK_NULL_HANDLE, hch[j].mem = VK_NULL_HANDLE;
     }
     plat_reset_guest(HEAP_BASE, HEAP_BASE + size);  // (the window's own pages back)
+    // (A block the GPU didn't see the CPU's bytes in: gralloc gave cached memory - a MediaTek gralloc, POCO X7 Pro. Asking
+    // it again for a CPU used rarely - uncached - restarted that phone as the game started, 2026-11-25: never automatic.
+    // LARECOMP_VK_AHB_RARELY=1 asks for that from the start, a test only.)
     return false;
 }
 

@@ -209,15 +209,21 @@ done:
 // underneath. Its file is taken out of the buffer's handle (AHardwareBuffer_sendHandleToUnixSocket: the public NDK has
 // no getter for it) and mapped where the CPU wants it, and the buffer is imported into Vulkan for the GPU.
 #include <android/hardware_buffer.h>
+#include <fcntl.h>
 #include <sys/socket.h>
 
-// A BLOB of size bytes the CPU and the GPU both use, and its file (the handle's first fd, a dma-buf): -1 if not (why)
+// A BLOB of size bytes the CPU and the GPU both use, and its file (the handle's dma-buf): -1 if not (why)
+// The CPU's use asked of gralloc: often, or rarely with LARECOMP_VK_AHB_RARELY=1 - a test only: asked automatically for
+// the whole heap on a MediaTek gralloc (POCO X7 Pro), the phone restarted as the game started (2026-11-25)
+int g_ahb_cpu_rarely = -1;
 int vk_ahb_alloc(uint64_t size, AHardwareBuffer **out, const char **why) {
     *out = NULL;
     if (size > 0xFFFFFFFFull) { *why = "too big for a BLOB"; return -1; }
     AHardwareBuffer_Desc d = {.width = (uint32_t)size, .height = 1, .layers = 1, .format = AHARDWAREBUFFER_FORMAT_BLOB,
-                              .usage = AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN | AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN |
-                                       AHARDWAREBUFFER_USAGE_GPU_DATA_BUFFER};
+                              .usage = AHARDWAREBUFFER_USAGE_GPU_DATA_BUFFER};
+    if (g_ahb_cpu_rarely < 0) g_ahb_cpu_rarely = getenv("LARECOMP_VK_AHB_RARELY") && atoi(getenv("LARECOMP_VK_AHB_RARELY")) != 0;
+    d.usage |= g_ahb_cpu_rarely ? AHARDWAREBUFFER_USAGE_CPU_READ_RARELY | AHARDWAREBUFFER_USAGE_CPU_WRITE_RARELY
+                                : AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN | AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN;
     AHardwareBuffer *ahb = NULL;
     int e = AHardwareBuffer_allocate(&d, &ahb);
     if (e || !ahb) { errno = -e; *why = "AHardwareBuffer_allocate"; return -1; }
@@ -225,21 +231,42 @@ int vk_ahb_alloc(uint64_t size, AHardwareBuffer **out, const char **why) {
     if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sv)) { AHardwareBuffer_release(ahb); *why = "socketpair"; return -1; }
     int fd = -1;
     e = AHardwareBuffer_sendHandleToUnixSocket(ahb, sv[0]);
-    if (!e) {  // (the handle's ints in the data, its fds as SCM_RIGHTS: the first is the buffer's memory)
+    if (!e) {  // (the handle's ints in the data, its fds as SCM_RIGHTS)
+        // The buffer's memory: the file opened for reading and writing that is at least size bytes long, else the first
+        // one. Qualcomm's gralloc hands it first; a MediaTek one (POCO X7 Pro, Mali-G720) gave a file mmap refused with
+        // EACCES, so every file is looked at - and logged once, for a report.
         char data[1024], ctl[CMSG_SPACE(16 * sizeof(int))];
         struct iovec iov = {data, sizeof data};
         struct msghdr m = {.msg_iov = &iov, .msg_iovlen = 1, .msg_control = ctl, .msg_controllen = sizeof ctl};
+        int all[16], nall = 0, pick = -1;
         if (recvmsg(sv[1], &m, MSG_CMSG_CLOEXEC) >= 0) {
             for (struct cmsghdr *c = CMSG_FIRSTHDR(&m); c; c = CMSG_NXTHDR(&m, c)) {
                 if (c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_RIGHTS) continue;
                 int n = (int)((c->cmsg_len - CMSG_LEN(0)) / sizeof(int));
                 int *fds = (int *)CMSG_DATA(c);
                 for (int i = 0; i < n; i++) {
-                    if (fd < 0) fd = fds[i];
+                    if (nall < 16) all[nall++] = fds[i];
                     else close(fds[i]);
                 }
             }
         }
+        static int told;
+        char desc[512];
+        int dn = 0;
+        for (int i = 0; i < nall; i++) {
+            off_t len = lseek(all[i], 0, SEEK_END);
+            lseek(all[i], 0, SEEK_SET);
+            int fl = fcntl(all[i], F_GETFL);
+            bool rw = fl >= 0 && (fl & O_ACCMODE) == O_RDWR;
+            if (dn < (int)sizeof desc - 64)
+                dn += snprintf(desc + dn, sizeof desc - dn, "%s#%d %lld bytes %s", i ? ", " : "", i, (long long)len,
+                               fl < 0 ? "?" : rw ? "rw" : (fl & O_ACCMODE) == O_RDONLY ? "ro" : "wo");
+            if (fd < 0 && rw && len >= (off_t)size) fd = all[i], pick = i;
+        }
+        if (fd < 0 && nall) fd = all[0], pick = 0;
+        for (int i = 0; i < nall; i++) if (all[i] != fd) close(all[i]);
+        if (!told++) LOG("[vk] Android hardware buffer of %llu bytes: %d file(s) in its handle: %s - using #%d\n",
+                         (unsigned long long)size, nall, nall ? desc : "none", pick);
     } else errno = -e;
     close(sv[0]);
     close(sv[1]);
@@ -295,16 +322,24 @@ bool vk_ahb_coherent(uint8_t *p, VkBuffer buf, VkDeviceMemory mem, uint64_t off,
     vbi.pNext = &eb;
     VkBuffer out = VK_NULL_HANDLE;
     bool ok = false;
-    for (int i = 0; i < 4096; i++) p[i] = (uint8_t)(i * 7 + 3);
+    // Three rounds, each the strict case for a cache the GPU doesn't snoop: the CPU's bytes written just before the
+    // GPU reads them (still in the CPU's cache), and the bytes the GPU will write read by the CPU just before (stale
+    // lines in its cache). One round alone passed on a MediaTek gralloc's cached memory once in two runs (POCO X7 Pro):
+    // whether the lines had left the cache by chance.
     if (vkCreateBuffer(g_vk.dev, &vbi, NULL, &out) != VK_SUCCESS || vkBindBufferMemory(g_vk.dev, out, mem, off) != VK_SUCCESS)
         *why = "a second buffer on its memory";
-    else if (!gpu_round(buf, out)) *why = "the GPU's round (submission)";
-    else {
+    for (int round = 0; round < 3 && !*why; round++) {
+        volatile uint8_t sink = 0;
+        for (int i = 0; i < 4096; i++) sink ^= p[off + 4096 + i];  // (into the CPU's cache)
+        (void)sink;
+        for (int i = 0; i < 4096; i++) p[i] = (uint8_t)(i * 7 + 3 + round);
+        if (!gpu_round(buf, out)) { *why = "the GPU's round (submission)"; break; }
         bool gpu_sees = true, cpu_sees = true;
-        for (int i = 0; i < 4096 && gpu_sees; i++) gpu_sees = p[off + i] == (uint8_t)(i * 7 + 3);
+        for (int i = 0; i < 4096 && gpu_sees; i++) gpu_sees = p[off + i] == (uint8_t)(i * 7 + 3 + round);
         for (int i = 0; i < 4096 && cpu_sees; i++) cpu_sees = p[off + 4096 + i] == 0x5a;
-        ok = gpu_sees && cpu_sees;
-        if (!ok) *why = !gpu_sees ? "the GPU doesn't see the CPU's bytes" : "the CPU doesn't see the GPU's bytes";
+        if (!gpu_sees || !cpu_sees) { *why = !gpu_sees ? "the GPU doesn't see the CPU's bytes" : "the CPU doesn't see the GPU's bytes"; break; }
+        memset(p + off, 0, 8192);  // (the next round's GPU writes over zeros again)
+        ok = round == 2;
     }
     if (out) vkDestroyBuffer(g_vk.dev, out, NULL);
     memset(p, 0, 4096);
