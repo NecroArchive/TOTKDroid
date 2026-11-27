@@ -3311,6 +3311,11 @@ static VkRect2D scissor_rect(void) {
             float k = t0->height / 1080.0f;  // (target pixels a layout unit)
             float dy = widescreen_hud_top((x + sw * 0.5f - t0->width * 0.5f) / k, (t0->height * 0.5f - (y + sh * 0.5f)) / k);
             if (dy != 0) y -= (int)lroundf(dy * k);
+            // (and out to the screen's edge with its panes: widescreen_hud_shift_143 - the minimap's own scissor stayed
+            // in the middle 16:9 part, and only a sliver of the map showed in its moved disc)
+            extern float widescreen_hud_shift_143(float x);
+            float dx = widescreen_hud_shift_143((x + sw * 0.5f - t0->width * 0.5f) / k);
+            if (dx != 0) x += (int)lroundf(dx * k);
         }
     }
     {   // Widescreen (1.8.2): the HUD's camera widens with the scene's (widescreen.c rt_persp_update), which puts the 16:9
@@ -5437,6 +5442,24 @@ static void panefix_log(const char *why, const float *f) {
         (unsigned long long)g_cur_fs_hash, why, f[19], f[132], f[133], f[44], f[45], framepace_in_menu(), widescreen_in_menu());
 }
 
+// TOTK's HUD out to the screen's edges (widescreen.c widescreen_hud_shift_143), by rows: a pane drawn right after one of
+// the same shader and near it (a row of hearts, 40 of them reaching almost to the middle in the 100% save) moves as the
+// first of its row did - by its own place, the hearts nearer the middle moved less and the row came apart.
+static float hud_dx_143(float x) {  // (per shader: a heart's fill and frame may be drawn by turns)
+    extern float widescreen_hud_shift_143(float x);
+    static struct { uint64_t fs, frame; float x, d; } row[8];
+    static unsigned next;
+    uint64_t pf = renderer_present_count();
+    int i = 0;
+    while (i < 8 && row[i].fs != g_cur_fs_hash) i++;
+    float d;
+    if (i < 8 && row[i].frame == pf && fabsf(x - row[i].x) < 150.0f) d = row[i].d;
+    else d = widescreen_hud_shift_143(x);
+    if (i == 8) i = (int)(next++ & 7);
+    row[i].fs = g_cur_fs_hash, row[i].frame = pf, row[i].x = x, row[i].d = d;
+    return d;
+}
+
 static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32_t gx, uint32_t gy, uint32_t gz) {
     static const uint8_t zeros[0x10000];
     if (k == 0) {
@@ -5682,6 +5705,10 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
                     else m[19] = fabsf(f[19]) <= 960.0f ? f[19] * g : f[19] + copysignf(960.0f * (g - 1), f[19]);
                 } else if (map)
                     m[3] = f[3];  // (text: its origin where the spread layout puts it)
+                else if (g > 1.001f) {  // (the HUD out to the screen's edges while playing: widescreen_hud_shift_143)
+                    if (size >= 0x230) m[19] += hud_dx_143(f[19]);
+                    else m[3] += hud_dx_143(f[3] * 960.0f) / (960.0f * g);  // (text: its origin, in NDC)
+                }
                 m[23] += dy;
                 return ubo_span(c, size);
             }

@@ -206,6 +206,23 @@ float widescreen_hud_shift(float x) {
     return x < 0 ? -d : d;
 }
 
+// TOTK 1.4.3 (vulkan/exec.c cbuf_info, its 1920x1080 layouts kept in the middle 16:9 part): how far a HUD pane moves,
+// from its centre x in layout units (-960..960), while playing in the world (widescreen_world_play: the minimap's disc on
+// screen - TOTK's menus, talks and loading screens hide it, so their grids stay together). As 1.8.2's above: panes
+// nearer the sides than the middle (the hearts, the minimap, the stamina wheel's corner) move out by the middle part's
+// distance to the screen's edge, the middle ones (prompts, the location name) stay, a blend in between. Before, the
+// whole HUD stayed in the middle 16:9 part on a wide screen. LARECOMP_TOTK_HUD_EDGES=0: as before.
+float widescreen_hud_shift_143(float x) {
+    static int on = -1;
+    if (on < 0) on = !ENV("LARECOMP_TOTK_HUD_EDGES") || atoi(ENV("LARECOMP_TOTK_HUD_EDGES")) != 0;
+    if (!on || g_wide <= 1.001f || !widescreen_world_play()) return 0;
+    // (a step, not 1.8.2's blend: a lone piece in a blend - the yellow heart after two rows of red ones in the 100% save
+    // - moved part of the way and stood apart from its row. The middle ones - prompts, the location name - stay)
+    if ((x < 0 ? -x : x) < 200.0f) return 0;
+    float d = 960.0f * (g_wide - 1.0f);
+    return x < 0 ? -d : d;
+}
+
 void widescreen_frame_end(uint64_t frame) { (void)frame; }
 
 // Draws to stretch with the wide view (identified by fragment shader hash): none.
