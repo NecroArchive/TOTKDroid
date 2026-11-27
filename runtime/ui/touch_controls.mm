@@ -39,6 +39,7 @@ extern "C" {
 uint64_t vk_imgui_texture_rgba(const void *rgba, int w, int h);
 bool menu_input_captured(void);  // ui/menu.mm
 void menu_test_open(void);       // ui/menu.mm: opens the in-game menu
+int nfp_reader_state(void);      // services/nfp.c: 1 while the game looks for an amiibo
 void menu_request_close(void);   // ui/menu.mm
 bool input_pad_present(void);    // hle/input.c: a controller with axes (not a fingerprint sensor, #477; from BOTWRecomp 0ea51bb)
 bool input_pad_usable(uint32_t id);
@@ -378,7 +379,10 @@ static void recompute(void) {  // (t_lock held; also once a frame: the power's h
         if (c >= 0 && c < 16) b |= 1ull << c;
         if (c < C_ICON || c >= C_ICON + I_N) continue;
         int k = c - C_ICON;
-        if (IC[k].bit >= 0 && IC[k].bit < 16) b |= 1ull << IC[k].bit;
+        // (while the game looks for an amiibo, the power's touch holds no L: its tap opens the amiibo picker instead -
+        // icon_release - and an L held under the finger reached the game first; held into the wheel, L as usual)
+        bool amiibo_tap = k == I_POWER && !fingers[i].wheel && nfp_reader_state() == 1;
+        if (IC[k].bit >= 0 && IC[k].bit < 16 && !amiibo_tap) b |= 1ull << IC[k].bit;
         if (k == I_POWER) {  // (L while it's held; held long enough, the game's wheel - the drag its stick)
             if (!fingers[i].wheel && now - fingers[i].t0 >= POWER_HOLD_MS) fingers[i].wheel = true;
             if (fingers[i].wheel) wheel_held = true, wheel_update(fingers[i].x - fingers[i].sx, fingers[i].y - fingers[i].sy), aim = i;
@@ -419,12 +423,15 @@ static void recompute(void) {  // (t_lock held; also once a frame: the power's h
 }
 
 // (icon layout) a finger off an icon control: a tap shorter than PULSE_MS keeps its button that long; the power held
-// into the game's wheel: the slot its drag pointed at (not when the touch was cancelled)
-static void icon_release(int f, bool cancelled) {  // (t_lock held)
+// into the game's wheel: the slot its drag pointed at (not when the touch was cancelled). While the game looks for an
+// amiibo (the Purah Pad's amiibo ability aimed), the power's tap opens the menu on the amiibo picker instead of
+// pressing L (true: the caller opens it, after the lock)
+static bool icon_release(int f, bool cancelled) {  // (t_lock held)
     int c = fingers[f].ctl;
-    if (editing || c < C_ICON || c >= C_ICON + I_N) return;
+    if (editing || c < C_ICON || c >= C_ICON + I_N) return false;
     int k = c - C_ICON;
     uint64_t now = SDL_GetTicks();
+    if (k == I_POWER && !fingers[f].wheel && !cancelled && nfp_reader_state() == 1) return true;
     if (k == I_POWER && fingers[f].wheel) {
         if (!cancelled && wheel_pick >= 0) {  // (the wheel's pick)
             wheel_stick_until = now + WHEEL_STICK_MS, wheel_rx = g_touch_rx, wheel_ry = g_touch_ry;
@@ -438,6 +445,7 @@ static void icon_release(int f, bool cancelled) {  // (t_lock held)
     if (k == I_WEAPON || k == I_SHIELD || (k == I_POWER && fingers[f].wheel)) keep_icons_until = now + 5000;
     if (k == I_INVENTORY) keep_icons_until = 0;
     if (k == I_BLOCK) block_up_ms = now;  // (a second touch soon: shield surfing)
+    return false;
 }
 
 static void release_all(void) {
@@ -636,6 +644,8 @@ extern "C" bool touch_controls_event(const SDL_Event *e) {
             else stick_update(s);
         }
         if (ctl == C_MENU && !editing) act = C_MENU;
+        if (ctl == TB_L && !editing && nfp_reader_state() == 1)  // (the classic layout's L: the amiibo's, as the power's)
+            fingers[nfingers - 1].ctl = C_NONE, act = C_MENU;
         if (is_bar(ctl)) act = ctl;
     } else if (e->type == SDL_EVENT_FINGER_MOTION && f >= 0) {
         float px = fingers[f].x, py = fingers[f].y;
@@ -669,7 +679,7 @@ extern "C" bool touch_controls_event(const SDL_Event *e) {
         }
     } else if ((e->type == SDL_EVENT_FINGER_UP || e->type == SDL_EVENT_FINGER_CANCELED) && f >= 0) {
         if ((fingers[f].ctl == C_STICK || fingers[f].ctl == C_RSTICK) && !editing) stick_release(fingers[f].ctl == C_RSTICK);
-        icon_release(f, e->type == SDL_EVENT_FINGER_CANCELED);
+        if (icon_release(f, e->type == SDL_EVENT_FINGER_CANCELED)) act = C_MENU;
         fingers[f] = fingers[--nfingers];
     }
     recompute();

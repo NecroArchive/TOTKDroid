@@ -71,6 +71,7 @@ extern "C" bool vk_fg_built(void);
 extern "C" void touch_controls_draw(ImVec2 display, ImFont *font);
 #endif
 static void set_open(bool open);
+extern "C" int nfp_reader_state(void);  // (services/nfp.c: the game looks for an amiibo)
 extern "C" void menu_test_open(void) {
     set_open(true);
     if (getenv("LARECOMP_MENU_TAB")) { extern int g_tab_request_ext; g_tab_request_ext = atoi(getenv("LARECOMP_MENU_TAB")); }
@@ -90,6 +91,8 @@ static void set_open(bool open) {
         static bool opened;  // the controller's cursor: the first tab (Controls) the first time this session, later the
         menu_tabs_focus(!opened);  // selected one
         opened = true;
+        extern int g_tab_request_ext;
+        if (nfp_reader_state() == 1) g_tab_request_ext = 8;  // (the game looks for an amiibo: Controls, amiibo on top)
     }
     else { settings_save(); osk_cancel(); g_text_busy = false; }
 }
@@ -878,7 +881,39 @@ static void tab_quit(float scale, bool in_game) {
     opt_end();
 }
 
+// amiibo (services/nfp.c, ported from BOTWRecomp): a figure picked here is "touched" on the game's virtual reader. At the
+// top of Controls while the game looks for one (the Purah Pad's amiibo ability: a second tap on the touch controls' power
+// opens the menu here), lower down otherwise.
+extern "C" int nfp_amiibo_count(void);
+extern "C" const char *nfp_amiibo_name(int i);
+extern "C" void nfp_touch(int i);
+extern "C" void nfp_lift(void);
+static void amiibo_section(int state) {
+    static int pick;
+    static std::vector<const char *> names;
+    if (names.empty())
+        for (int i = 0; i < nfp_amiibo_count(); i++) names.push_back(nfp_amiibo_name(i));
+    header("amiibo");
+    choice("amiibo", &pick, names.data(), (int)names.size());
+    hint(state == 1 ? "The game is looking for an amiibo: pick one and touch it."
+         : state == 2 ? "An amiibo is on the reader."
+                      : "Choose the amiibo ability on the Purah Pad (the ability wheel) and aim it, then open this menu and "
+                        "touch an amiibo here. Each figure gives its items once a day, as on the Switch.");
+    // (a big button, the page's width: a finger's)
+    if (state == 1 && ImGui::Button(tr("Touch the amiibo"), ImVec2(-FLT_MIN, ImGui::GetFontSize() * 2.6f))) {
+        nfp_touch(pick);
+        set_open(false);  // (back to the game, which reads it)
+    }
+    if (state == 2) {
+        ImGui::SameLine();
+        if (ImGui::Button(tr("Lift the amiibo"))) nfp_lift();
+    }
+    ImGui::Spacing();
+}
+
 static void tab_about(void) {
+    int nfp_state = nfp_reader_state();
+    if (nfp_state) amiibo_section(nfp_state);
     header("System language");
     {
         // what the game is told the console's language is: its text follows this (runtime/settings.c)
@@ -911,6 +946,7 @@ static void tab_about(void) {
                 "The game's rumble: on the controller's motors, or the phone's own vibrator without a controller. 0%: off."))
         settings_save();
     ImGui::Spacing();
+    if (!nfp_state) amiibo_section(0);
     controls_bindings_draw(ImGui::GetFontSize() / 34);
     ImGui::Spacing();
     header("Menu");
