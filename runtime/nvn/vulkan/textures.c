@@ -1219,7 +1219,16 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
     if (!t->addr || t->target == 10) return;
     uint64_t frame = vk_frame_counter();
     if (b->uploaded && b->checked_frame == frame) return;
-    if (b->uploaded && !b->dynamic && ((frame + ((uintptr_t)b >> 6)) & 7) && !__atomic_load_n(&b->check_suspect, __ATOMIC_ACQUIRE))
+    // A texture that never changed since its upload is checked every 8th frame - but a linear one (flag 0x40 / 0x10)
+    // every frame (BOTWRecomp 8053dc8): the game fills linear tiles on the CPU (BOTW's terrain heights, 256x256 R16) and
+    // draws them into its arrays right away, once. Read up to 7 frames late, an array layer was built from the tile's
+    // old contents and kept them: stretched "curtains" and scenery that came and went (TOTK too, POCO F7 Ultra, the
+    // user's video, 2026-11-27). Few textures are linear, and page tracking makes most checks free.
+    // LARECOMP_LIN_STAGGER=1: every 8th frame, as before.
+    static int lin_every = -1;
+    if (lin_every < 0) lin_every = !getenv("LARECOMP_LIN_STAGGER");
+    if (b->uploaded && !b->dynamic && !(lin_every && (t->flags & 0x50)) && ((frame + ((uintptr_t)b >> 6)) & 7) &&
+        !__atomic_load_n(&b->check_suspect, __ATOMIC_ACQUIRE))
         return;
     const FormatInfo *fi = t->layout.fmt;
     if (!fi || !fi->bpb) return;
