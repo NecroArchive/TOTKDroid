@@ -6217,9 +6217,9 @@ bool vk_heap_place(uint64_t size) {
     if (!memfd && (!g_vk.map_placed || no_placed)) return NOT_PLACED();
     extern bool vk_turnip_path_on(int setting);
     if (memfd ? g_settings.gpu_heap == 0 : !vk_turnip_path_on(g_settings.gpu_heap)) {
-        // (the start screen's Driver compatibility: Automatic leaves it to the Adreno 8xx it was made on)
+        // (the start screen's Driver compatibility: Automatic: Adreno 7xx and 8xx, device.c vk_heap_auto)
         LOG("[vk] guest heap as GPU memory: off (%s) - shader global memory through CPU copies\n",
-            g_settings.gpu_heap < 0 ? "automatic: not an Adreno 8xx" : "settings");
+            g_settings.gpu_heap < 0 ? "automatic: not an Adreno 7xx / 8xx" : "settings");
         return NOT_PLACED();
     }
     {   // The placed heap is committed at once (~3.1 GB for BOTW), where CPU copies commit only the pages the game

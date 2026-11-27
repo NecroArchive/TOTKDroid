@@ -610,6 +610,7 @@ static bool android_copy_document(const std::string &uri, const std::string &dst
 // (TOTKRecompAndroidActivity pickLogFolder / openLog), where a file manager can open it - Android/data/ is out of its reach
 extern "C" void android_log_file(bool on);
 extern "C" bool vk_adreno_8xx(const char *name);
+extern "C" bool vk_heap_auto(void);
 extern "C" bool vk_adreno_7xx_8xx(const char *name);  // (Driver compatibility's Automatic: runtime/nvn/vulkan/device.c)
 extern "C" const char *vk_driver_env_at_start(void);
 extern "C" bool vk_lrz_at_start(void);
@@ -1798,6 +1799,7 @@ static void prelaunch_tab(float sc) {
         // LASRecompAndroid's, with BOTW's in-place reads of draw targets)
         bool changed = false;
         const bool a8 = vk_adreno_8xx(vk_gpu_name());  // (Automatic: on for Adreno 8xx only)
+        const bool heap_auto = vk_heap_auto();  // (the game's memory on the GPU: 7xx too)
         const bool a78 = vk_inplace_auto();  // (in-place reads: 7xx too, #48; Mali, #73)
         auto tri = [&](const char *id, int *v, bool auto_on) {  // Automatic / On / Off: -1 / 1 / 0
             bool ch = false;
@@ -1819,7 +1821,7 @@ static void prelaunch_tab(float sc) {
             ImGui::TextDisabled("%s", tr("These options are for Turnip: the driver in use takes the safer paths anyway."));
         ImGui::Spacing();
         ImGui::Text("%s", tr("Game memory on the GPU (Turnip)"));
-        changed |= tri("heap", &g_settings.gpu_heap, a8);
+        changed |= tri("heap", &g_settings.gpu_heap, heap_auto);
         ImGui::TextDisabled("%s", tr("On: the game's memory is mapped straight into the GPU's, the fastest way. Off: what each "
                                   "frame uses is copied instead - it draws right where the fast way doesn't, but this game "
                                   "runs at about half the frame rate (15 fps instead of 35 on an Adreno 830). Automatic: on "

@@ -2024,8 +2024,15 @@ bool vk_adreno_8xx(const char *name) {
     int n = atoi(a);
     return n >= 800 && n < 900;
 }
+bool vk_adreno_7xx_8xx(const char *name);
+// The game's memory as GPU memory (settings.h gpu_heap): Automatic is on for Adreno 7xx as well as 8xx. Off, an Adreno
+// 750 (POCO F7 Pro, Turnip T30 and Gen8 V37) held TOTK's Sky Islands at ~15 fps, the render thread ~63 ms a frame on the
+// CPU copies (~850 MB/s); on, 27.6-30 fps at 720p, GPU 33 -> 16 ms, picture the same. LAS's wrong text and colors on a
+// 750 were another game's (the 8xx-only Automatic came from LASRecompAndroid). Below ~7 GB of RAM it stays off anyway
+// (exec.c vk_heap_place).
+bool vk_heap_auto(void) { return vk_adreno_7xx_8xx(g_vk.props.deviceName); }
 // A Turnip path's setting (-1 Automatic, 1 on, 0 off) for this GPU
-bool vk_turnip_path_on(int setting) { return setting < 0 ? vk_adreno_8xx(g_vk.props.deviceName) : setting != 0; }
+bool vk_turnip_path_on(int setting) { return setting < 0 ? vk_heap_auto() : setting != 0; }
 
 // Draw-target reads in place (exec.c resolve_feedback): Automatic is on for Adreno 7xx as well as 8xx. With copies, an
 // Adreno 740's first shrine made ~10,000 copies of whole targets a second - 30 fps fell to 5-8 (#48); the 7xx's 732 and
