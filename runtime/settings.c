@@ -68,6 +68,9 @@ Settings g_settings = {
     .native_code = true,        // (the game's own code on the CPU, runtime/native.c. Same walk in the prologue cave, 2026-10-30:
                                 // recompiled 27.7 fps, frame time sd 7.4 ms, 25% of frames over 36 ms, 1.5 cores of game
                                 // threads; native 30.0 fps, sd 0.6 ms, none over 36 ms, 0.86 cores)
+    .pipe_prewarm = false,      // (vulkan/pipeline_prewarm.inc; LARECOMP_PIPE_PREWARM=0 / 1 wins. Off: in TOTK a world
+                                // program exists only after its first draw - 12 of 256 records ready at a load, 2026-11-27)
+    .shader_wait = false,       // (off: draws skipped while their shader is built; LARECOMP_SYNC_SHADERS wins)
     .sync_lag = true,           // (the CPU's reads of GPU results a frame old - nvn/objects.c nvnSyncWait - so the game's next
                                 // frame overlaps the render thread and the GPU: +16.9% in TOTK, 22.0 -> 25.7 fps on the POCO
                                 // F7 Ultra, Great Sky Island, LARECOMP_AB=120:synclag in one launch, 2026-10-30; it starts
@@ -239,6 +242,8 @@ void settings_reset_defaults(void) {
     g_settings.fps60_hysteresis = d->fps60_hysteresis;
     g_settings.shader_int32 = d->shader_int32;
     g_settings.sync_lag = d->sync_lag;
+    g_settings.pipe_prewarm = d->pipe_prewarm;
+    g_settings.shader_wait = d->shader_wait;
     g_settings.low_ram = d->low_ram;
     g_settings.files_in_place = d->files_in_place;
     g_settings.native_code = d->native_code;
@@ -300,6 +305,8 @@ void settings_load(void) {
         else if (!strcmp(key, "frame_rate")) g_settings.fps_mode = !strcmp(val, "30") ? 1 : !strcmp(val, "60") ? 2 : !strcmp(val, "20") ? 3 : (!strcmp(val, "40") || !strcmp(val, "45")) ? 4 : !strcmp(val, "unlocked") ? 5 : 0;
         else if (!strcmp(key, "shader_int32")) g_settings.shader_int32 = atoi(val) != 0;
         else if (!strcmp(key, "sync_lag")) g_settings.sync_lag = atoi(val) != 0;
+        else if (!strcmp(key, "pipe_prewarm")) g_settings.pipe_prewarm = atoi(val) != 0;
+        else if (!strcmp(key, "shader_wait")) g_settings.shader_wait = atoi(val) != 0;
         else if (!strcmp(key, "files_in_place")) g_settings.files_in_place = atoi(val) != 0;
         else if (!strcmp(key, "native_code")) g_settings.native_code = atoi(val) != 0;
         else if (!strcmp(key, "gpu_heap")) g_settings.gpu_heap = !strcmp(val, "auto") ? -1 : atoi(val) != 0;
@@ -421,6 +428,7 @@ void settings_save(void) {
     fprintf(f, "frame_rate = %s\n", g_settings.fps_mode == 1 ? "30" : g_settings.fps_mode == 2 ? "60" : g_settings.fps_mode == 3 ? "20" : g_settings.fps_mode == 4 ? "45" : g_settings.fps_mode == 5 ? "unlocked" : "auto");
     fprintf(f, "shader_int32 = %d\nsync_lag = %d\nfiles_in_place = %d\nnative_code = %d\n", g_settings.shader_int32,
             g_settings.sync_lag, g_settings.files_in_place, g_settings.native_code);
+    fprintf(f, "pipe_prewarm = %d\nshader_wait = %d\n", g_settings.pipe_prewarm ? 1 : 0, g_settings.shader_wait ? 1 : 0);
     static const char *const tri[] = {"auto", "0", "1"};  // (-1 / 0 / 1)
 #define TRI(v) tri[(v) < 0 ? 0 : (v) ? 2 : 1]
     fprintf(f, "gpu_heap = %s\nheap_file = %d\ninplace_reads = %s\nturnip_lrz = %s\nlog_file = %d\ngpu_model = %s\n",

@@ -65,6 +65,8 @@ typedef struct {
     bool shader_int32;    // shader address math in 32-bit words even where the driver offers 64-bit (vulkan/exec.c)
     bool files_in_place;  // Android: a setup reads the picked romfs/ where it is, no copy (services/fs.c); off by default
     bool native_code;     // Android: the game's own code on the CPU, no build of it (runtime/native.c); off by default
+    bool pipe_prewarm;    // Android: recorded graphics pipelines built while the game loads (vulkan/pipeline_prewarm.inc); off by default
+    bool shader_wait;     // Android: a draw waits for its shader / pipeline to be built, none skipped (vulkan/exec.c sync_shaders); off by default
     bool sync_lag;        // Android: the game's next frame overlaps the GPU's last (nvn/objects.c nvnSyncWait); on by default
     int low_ram;          // RAM saving (vulkan/exec.c vk_low_ram): -1 automatic (devices up to 4 GB), 1 on, 0 off; read once,
                           // as the app starts

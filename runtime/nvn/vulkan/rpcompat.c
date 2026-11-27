@@ -6,12 +6,14 @@
 // pass has the same self-dependency, so any two with the same formats and samples stay compatible.
 // LARECOMP_NO_DYNAMIC_RENDERING=1 (device.c) takes this path on any driver: tested on Adreno.
 #include <pthread.h>
+#include <stdatomic.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "vk.h"
 
-#define RP_MAX 512
+#define RP_INIT_CAP 1024       // (power of two; grows on > 50% load - BOTWRecomp c1a29d93: a hashed table, not a 512-entry scan)
 #define FB_MAX 8192            // (a power of two: open addressing)
 #define FB_VIEWS 9             // 8 colors and a depth / stencil
 #define VSET_MAX 8192          // (a power of two) views some framebuffer holds, and how many
@@ -23,10 +25,14 @@ typedef struct {
     uint32_t load[FB_VIEWS], store[FB_VIEWS], sload, sstore;  // (index 8: depth; VkAttachmentLoadOp / StoreOp)
     VkImageLayout layout[FB_VIEWS];
     uint8_t depth, stencil;  // the depth / stencil attachment's aspects in use
+    uint8_t pad[2];          // explicit zero tail padding for exact byte-wise key comparisons/hashing
 } RpKey;
 
+typedef struct { RpKey k; VkRenderPass rp; uint8_t used; } RpEnt;
+
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
-static struct { RpKey k; VkRenderPass rp; } rps[RP_MAX];
+static RpEnt *rps;
+static uint32_t rp_cap;
 static int nrps;
 
 typedef struct { VkRenderPass rp; VkImageView v[FB_VIEWS]; uint32_t w, h; VkFramebuffer fb; uint8_t state; } FbEnt;  // state 1 live, 2 gone
@@ -81,15 +87,76 @@ static VkRenderPass make_rp(const RpKey *k) {
     return rp;
 }
 
+static uint32_t rp_hash(const RpKey *k) {
+    _Static_assert(sizeof(RpKey) % 4 == 0, "RpKey must be a multiple of 4 bytes");
+    _Static_assert(offsetof(RpKey, pad) + sizeof(((RpKey *)0)->pad) == sizeof(RpKey),
+                   "RpKey must have no implicit tail padding");
+    uint64_t h = 0xcbf29ce484222325ull;
+    const uint8_t *p = (const uint8_t *)k;
+    for (size_t i = 0; i < sizeof *k; i += 4) {
+        uint32_t w;
+        memcpy(&w, p + i, 4);
+        h = mix(h, w);
+    }
+    return (uint32_t)(h ^ (h >> 32));
+}
+
+static bool rp_grow(void) {  // (lock held)
+    uint32_t old_cap = rp_cap;
+    uint32_t ncap = old_cap ? old_cap * 2u : RP_INIT_CAP;
+    if (ncap < old_cap) return false;
+    RpEnt *ntab = calloc(ncap, sizeof *ntab);
+    if (!ntab) return false;
+    uint32_t mask = ncap - 1u;
+    for (uint32_t i = 0; i < old_cap; i++) {
+        if (!rps[i].used) continue;
+        uint32_t s = rp_hash(&rps[i].k) & mask;
+        while (ntab[s].used) s = (s + 1u) & mask;
+        memcpy(&ntab[s].k, &rps[i].k, sizeof ntab[s].k);
+        ntab[s].rp = rps[i].rp;
+        ntab[s].used = 1;
+    }
+    free(rps);
+    rps = ntab;
+    rp_cap = ncap;
+    if (old_cap > 0)
+        LOG("[vk] render passes (no dynamic rendering): grew table %u -> %u (%d entries)\n", old_cap, ncap, nrps);
+    return true;
+}
+
 static VkRenderPass get_rp(const RpKey *k) {  // (lock held)
-    for (int i = 0; i < nrps; i++)
-        if (!memcmp(&rps[i].k, k, sizeof *k)) return rps[i].rp;
+    if (!rps && !rp_grow()) return VK_NULL_HANDLE;
+    uint32_t s0 = rp_hash(k);
+    uint32_t mask = rp_cap - 1u;
+    uint32_t free_slot = ~0u;
+    for (uint32_t i = 0; i < rp_cap; i++) {
+        uint32_t s = (s0 + i) & mask;
+        if (!rps[s].used) { free_slot = s; break; }
+        if (!memcmp(&rps[s].k, k, sizeof *k)) return rps[s].rp;
+    }
+    if (((uint64_t)(uint32_t)nrps + 1ull) * 2ull > rp_cap) {
+        if (rp_grow()) {
+            mask = rp_cap - 1u;
+            free_slot = s0 & mask;
+            while (rps[free_slot].used) free_slot = (free_slot + 1u) & mask;
+        }
+    }
+    if (free_slot == ~0u || (uint32_t)nrps + 1u >= rp_cap) {
+        static _Atomic bool full_logged;
+        if (!atomic_exchange_explicit(&full_logged, true, memory_order_relaxed))
+            LOG("[vk] render passes (no dynamic rendering): table full at %d entries, dropping pass\n", nrps);
+        return VK_NULL_HANDLE;
+    }
     VkRenderPass rp = make_rp(k);
-    if (rp && nrps < RP_MAX) {
-        rps[nrps].k = *k;
-        rps[nrps++].rp = rp;
-        static int logged;
-        if (logged++ < 8 || nrps == RP_MAX) LOG("[vk] render passes (no dynamic rendering): %d\n", nrps);
+    if (!rp) return VK_NULL_HANDLE;
+    memcpy(&rps[free_slot].k, k, sizeof *k);
+    rps[free_slot].rp = rp;
+    rps[free_slot].used = 1;
+    nrps++;
+    static int logged;
+    if (logged < 8) {
+        logged++;
+        LOG("[vk] render passes (no dynamic rendering): %d\n", nrps);
     }
     return rp;
 }

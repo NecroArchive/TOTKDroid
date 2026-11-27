@@ -1884,10 +1884,23 @@ static void *worker(void *a) {
     return NULL;
 }
 
+// Draws wait for their shader / pipeline (built on first use, blocking): LARECOMP_SYNC_SHADERS when set ("0": off,
+// anything else on), else the "Wait for shaders" setting (Video tab, shader_wait). Read once, again after a reboot
+// (vk_exec_reset: Quit > Return to start), so a change applies the next time the game starts.
+static int g_sync_shaders = -1;
 static bool sync_shaders(void) {
-    static int v = -1;
-    if (v < 0) v = getenv("LARECOMP_SYNC_SHADERS") != NULL;
-    return v;
+    int v = g_sync_shaders;
+    if (v < 0) {
+        const char *e = getenv("LARECOMP_SYNC_SHADERS");
+        if (e) v = e[0] != '0';
+#ifdef __ANDROID__
+        else v = __atomic_load_n(&g_settings.shader_wait, __ATOMIC_RELAXED) ? 1 : 0;
+#else
+        else v = 0;
+#endif
+        g_sync_shaders = v;
+    }
+    return v != 0;
 }
 
 // Shader translation: one dedicated thread (the translator isn't re-entrant - translate.c's RSC2 string ring - and
@@ -3581,13 +3594,29 @@ static void descriptor_plan(const VkBindingInfo *binds, int count, uint32_t set,
     for (int i = 0; i < count; i++) {
         const VkBindingInfo *b = &binds[i];
         if (b->set != set) continue;
+        int ubo = b->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || b->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
         if ((b->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && b->binding >= 32) ||
-            (b->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && b->binding < 17) || b->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
+            (ubo && b->binding < 17) || b->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
             plan->regular[plan->nregular++] = (uint8_t)i;
-        else if (b->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER &&
+        else if (ubo &&
                  (b->binding == 18 || b->binding == 19 || b->binding == GMAP_BUFFER_INDEX || b->binding == CBPATCH_BUFFER_INDEX))
             plan->deferred[plan->ndeferred++] = (uint8_t)i;
     }
+}
+#endif
+#ifdef __ANDROID__
+// Pipeline prewarming (pipeline_prewarm.inc; from BOTWRecomp 6454ccc1): a program's identity across runs, the hashes of
+// its two SPIR-V modules and of the shader keys, set when the program is made (compile_program_from_spirv)
+typedef struct { uint64_t vs_h, fs_h, key_h; uint32_t nv, nf; } PwProgId;
+static _Atomic int pw_env = -2;  // -2 unread, -1 unset, 0 forced off, 1 forced on
+static bool prewarm_enabled(void) {
+    int e = atomic_load_explicit(&pw_env, memory_order_relaxed);
+    if (e == -2) {
+        const char *v = getenv("LARECOMP_PIPE_PREWARM");
+        e = (v && *v) ? (atoi(v) != 0) : -1;
+        atomic_store_explicit(&pw_env, e, memory_order_relaxed);
+    }
+    return e >= 0 ? e != 0 : __atomic_load_n(&g_settings.pipe_prewarm, __ATOMIC_RELAXED);
 }
 #endif
 typedef struct {
@@ -3600,6 +3629,7 @@ typedef struct {
     int nbinds;
 #ifdef __ANDROID__
     DescriptorPlan descriptor_plans[2];
+    PwProgId pw_id;  // (pipeline prewarming; written once by the worker that makes the program, read after state 1)
 #endif
     VkDescriptorSetLayout set_layout[2];
     VkPipelineLayout layout;
@@ -3685,6 +3715,17 @@ static bool meta_cache_on(void);  // (.smeta: below)
 // the .spv cache after a translation) or from prog_fast_or_translate (from_meta: no translation at all; BOTWRecomp b4e80e7)
 static void compile_program_from_spirv(Prog *p, uint32_t *sv, size_t nv, uint32_t *sf, size_t nf, bool from_meta) {
     if (!sv || !sf || atomic_load_explicit(&jobs_abort, memory_order_acquire)) { free(sv); free(sf); signal_build_done(&p->state, 2); return; }
+#ifdef __ANDROID__
+    if (prewarm_enabled()) {  // (the program's identity for the prewarm records: its SPIR-V and shader keys, the same from the .smeta cache or a translation)
+        p->pw_id.nv = (uint32_t)nv;
+        p->pw_id.nf = (uint32_t)nf;
+        uint64_t vh = hash_words(0xcbf29ce484222325ull, sv, nv * sizeof *sv);
+        p->pw_id.vs_h = vh ? vh : 1;
+        p->pw_id.fs_h = hash_words(0xcbf29ce484222325ull, sf, nf * sizeof *sf);
+        uint64_t kh = hash_words(0xcbf29ce484222325ull, &p->vkey, sizeof p->vkey);
+        p->pw_id.key_h = hash_words(kh, &p->fkey, sizeof p->fkey);
+    }
+#endif
     p->nbinds = vk_reflect(sv, nv, p->binds, MAX_BIND);
     p->nbinds += vk_reflect(sf, nf, p->binds + p->nbinds, MAX_BIND - p->nbinds);
     p->vs = vk_module(sv, nv);
@@ -4334,7 +4375,18 @@ typedef struct {
     uint32_t used_s;     // when it was last bound (g_exec_s: no clock read per draw, BOTWRecomp fd7ec98)
     uint64_t seq;        // and that submission (pipe_evict)
     bool evicted;        // its VkPipeline destroyed by pipe_evict: built again at its next use
+    uint32_t retry_s;    // (failed for lack of memory) built again at its first use from then on (g_exec_s), 0: never
+#ifdef __ANDROID__
+    bool prewarmed;      // built ahead by pipeline_prewarm.inc, no draw has used it yet
+#endif
 } Pipe;
+#ifdef __ANDROID__
+static Pipe *pw_pending;  // (the prewarmed pipeline being built now; cleared where a pipeline is freed)
+#endif
+// A pipeline that failed for lack of memory (build_pipeline): pipe_evict frees the unused ones at once, whatever
+// pipe_keep says, and the failed one is built again at its first use 5 s later (BOTWRecomp 2d825023, #520: before, the
+// failure was for good - its draws dropped for the rest of the session, until the game crashed a few seconds later).
+static _Atomic int pipe_oom;
 static VkObjectCache pipe_cache;  // (growable, BOTWRecomp 848e08c: the fixed 8192-entry table's probe never ended once full)
 static Pipe *last_pipeline;  // (draw_'s: the previous draw's, reused when nothing changed)
 
@@ -4359,16 +4411,17 @@ static int pipe_keep(void) {
 static void pipe_evict(void) {
     static uint32_t next;
     int keep = pipe_keep();
-    if (keep <= 0 || g_exec_s < next) return;
+    bool oom = atomic_exchange(&pipe_oom, 0) != 0;  // (out of memory: now, and down to 3/4 of the live ones)
+    if (!oom && (keep <= 0 || g_exec_s < next)) return;
     next = g_exec_s + 10;  // (every 10 s)
     int live = 0;
     for (size_t i = 0; i < pipe_cache.capacity; i++) {
         Pipe *p = pipe_cache.entries[i].object;
         if (p && !p->evicted && atomic_load(&p->state) == 1) live++;
     }
-    if (live <= keep) return;
+    if (!oom && live <= keep) return;
     uint64_t done = vk_completed_seq();
-    int target = keep * 4 / 5, gone = 0;
+    int target = oom ? live * 3 / 4 : keep * 4 / 5, gone = 0;
     // oldest first: two passes, the unused for 2 minutes, then for 30 s
     static const uint32_t ages[2] = {120, 30};  // (s)
     for (int pass = 0; pass < 2 && live > target; pass++) {
@@ -4395,6 +4448,9 @@ static void pipe_evict(void) {
 // allocated (vk_exec_reset) or is tried again at the next check (prog_evict). A job's last act is its state store.
 static void pipe_free(Pipe *pp) {
     if (pp == last_pipeline) last_pipeline = NULL;
+#ifdef __ANDROID__
+    if (pp == pw_pending) pw_pending = NULL;
+#endif
     if (pp->pipe) {
         vkDestroyPipeline(g_vk.dev, pp->pipe, NULL);
         if (!pp->evicted && atomic_load(&pp->state) == 1) atomic_fetch_sub(&live_gpipes, 1);
@@ -4635,6 +4691,18 @@ static void build_pipeline(void *arg) {
     uint64_t fp = vk_fp_host("a pipeline");  // (FPCR 0 around the compile: vk_fpenv.h)
     VkResult r = vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, 1, &pi, NULL, &pp->pipe);
     vk_fp_put(fp);
+    {   // LARECOMP_PIPE_FAIL_OOM=<n>: the n-th to (n+19)-th pipelines built fail once as out of device memory (a test of
+        // the retry, BOTWRecomp 2d825023, #520; twenty, so some of them are drawn again)
+        static long fail_at = -1;
+        static _Atomic long built;
+        if (fail_at < 0) fail_at = getenv("LARECOMP_PIPE_FAIL_OOM") ? atol(getenv("LARECOMP_PIPE_FAIL_OOM")) : 0;
+        long nth = fail_at > 0 && r == VK_SUCCESS ? atomic_fetch_add(&built, 1) + 1 : 0;
+        if (nth && nth >= fail_at && nth < fail_at + 20) {
+            vkDestroyPipeline(g_vk.dev, pp->pipe, NULL);
+            pp->pipe = VK_NULL_HANDLE;
+            r = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+        }
+    }
     if (r != VK_SUCCESS) {
         static int n;
         if (n++ < 10) LOG("[vk] pipeline creation failed: %d\n", r);
@@ -4669,10 +4737,16 @@ static void build_pipeline(void *arg) {
 #endif
     atomic_fetch_add(&stat_compiles, 1);
     if (r == VK_SUCCESS) atomic_fetch_add(&live_gpipes, 1);
-    if (r != VK_SUCCESS) {  // (each failing key once: its draws are dropped)
+    if (r != VK_SUCCESS) {  // (each failing key once: its draws are dropped - for lack of memory, until a retry)
         static int n;
-        if (n++ < 20) LOG("[vk] graphics pipeline failed (%d): vs %llx fs %llx\n", (int)r,
-                          (unsigned long long)k->prog->code[0], (unsigned long long)k->prog->code[1]);
+        bool mem = r == VK_ERROR_OUT_OF_DEVICE_MEMORY || r == VK_ERROR_OUT_OF_HOST_MEMORY;
+        if (n++ < 20) LOG("[vk] graphics pipeline failed (%d): vs %llx fs %llx%s\n", (int)r,
+                          (unsigned long long)k->prog->code[0], (unsigned long long)k->prog->code[1],
+                          mem ? " - out of memory: unused pipelines freed, built again in 5 s" : "");
+        if (mem) {
+            pp->retry_s = g_exec_s + 5;
+            atomic_store(&pipe_oom, 1);
+        }
     }
     signal_build_done(&pp->state, r == VK_SUCCESS ? 1 : 2);
 }
@@ -4693,6 +4767,10 @@ static void schedule_pipeline_build(Pipe *pp, bool keep) {
     }
     run_job(build_pipeline, pp);
 }
+
+#ifdef __ANDROID__
+#include "pipeline_prewarm.inc"
+#endif
 
 // ================================================================== feedback snapshots (renderer.m resolve_feedback)
 static NvnTexture *feedback_tex[4];
@@ -6779,10 +6857,81 @@ static void gfast_finish(VkCommandBuffer cb) {
 // What a storing shader wrote goes back to guest memory once its submission is done (gcopy_retire: from vk_transient
 // before the ring reuses a chunk, and after every wait). Without this, global loads read zero: the game's text is
 // drawn by a vertex shader that reads its vertices that way (nothing of it showed).
-typedef struct { const uint8_t *src; uint64_t addr, len, seq; uint8_t *shadow; const uint64_t *bseq; } GcBack;  // (arena)
+// (shadow, bseq: the arena's; pre: outside it, the range as it was when copied for the GPU - gcopy_back_changed)
+typedef struct { const uint8_t *src; uint64_t addr, len, seq; uint8_t *shadow; const uint64_t *bseq; uint8_t *pre; } GcBack;
 static GcBack gc_back[256];
 static int gc_nback;
 static pthread_mutex_t gc_lock = PTHREAD_MUTEX_INITIALIZER;
+
+// One 256-byte block of the arena back into guest memory: only the 8-byte words the GPU changed (src against the
+// shadow), each with a compare-and-swap that expects the shadow's value, so a word the game's threads wrote since -
+// even while this runs - stays theirs. The check before (gcopy_retire: the CPU didn't write the block) and a plain
+// memcpy after it left a window: a game thread writing the block in between lost that write. The ranges have a
+// 4 KB margin before each bound buffer and gaps of up to 4 KB merged in (gcopy_ranges), where the game's heap keeps
+// its block headers and free-list links (BOTWRecomp d36c06a1, #401: a Mali-G1 hung walking a heap free list that
+// looped). LARECOMP_GA_BACK_WHOLE=1: the whole block, as before.
+static void ga_back_block(uint8_t *g, const uint8_t *src, uint8_t *sh, uint64_t n) {
+    static int whole = -1;
+    if (whole < 0) whole = getenv("LARECOMP_GA_BACK_WHOLE") && atoi(getenv("LARECOMP_GA_BACK_WHOLE"));
+    if (whole || ((uintptr_t)g & 7) || (n & 7)) {
+        memcpy(g, src, n);
+        return;
+    }
+    uint64_t *gw = (uint64_t *)g;
+    const uint64_t *sw = (const uint64_t *)src, *hw = (const uint64_t *)sh;
+    for (uint64_t w = 0; w < n / 8; w++) {
+        uint64_t s = sw[w], expect = hw[w];
+        if (s == expect) continue;  // (the GPU didn't change it: the game's, whatever it holds now)
+        if (__atomic_compare_exchange_n(&gw[w], &expect, s, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) continue;
+        // (the game wrote it since the check: kept. Before, this write was lost - logged, the evidence for #401)
+        static int told;
+        if (told < 20) {
+            told++;
+            LOG("[vk] arena copy-back: a word the game wrote meanwhile kept, at heap+%llx (GPU %016llx, game %016llx)\n",
+                (unsigned long long)((uintptr_t)&gw[w] - HEAP_BASE), (unsigned long long)s, (unsigned long long)expect);
+        }
+    }
+}
+
+// Outside the arena (on a Mali whose driver offers the host import the arena is off): what a storing shader wrote
+// went back as a whole-range memcpy of the copy it worked on, taken when the call was translated, so every word the
+// game's threads wrote since - in the 4 KB margin before each bound buffer and the gaps merged in (gcopy_ranges), where
+// the game's heap keeps its block headers and free-list links - went back to its old value (BOTWRecomp 97f14f22, #401).
+// Now only the 8-byte words the GPU changed (src against pre, the range as it was copied) go back, each by
+// compare-and-swap expecting pre's value: a word the game wrote meanwhile stays the game's (counted, the first ones
+// logged). Unaligned ends byte by byte, the same rule. LARECOMP_GCOPY_WHOLE=1: the whole range, as before.
+static void gcopy_back_changed(uint8_t *g, const uint8_t *src, const uint8_t *pre, uint64_t n) {
+    static uint64_t kept, told;
+    uint64_t k0 = kept, i = 0;
+    for (; i < n && ((uintptr_t)(g + i) & 7); i++) {  // (the head, to 8-byte alignment)
+        if (src[i] == pre[i]) continue;
+        if (g[i] == pre[i]) g[i] = src[i]; else kept++;
+    }
+    for (; i + 8 <= n; i += 8) {
+        uint64_t s, p;
+        memcpy(&s, src + i, 8);
+        memcpy(&p, pre + i, 8);
+        if (s == p) continue;  // (the GPU didn't change it: the game's, whatever it holds now)
+        uint64_t expect = p;
+        if (__atomic_compare_exchange_n((uint64_t *)(g + i), &expect, s, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) continue;
+        kept++;  // (the game wrote it since the copy: kept - the whole-range copy undid it)
+        if (told < 20) {
+            told++;
+            LOG("[vk] copy-back: a word the game wrote meanwhile kept, at heap+%llx (GPU %016llx, game %016llx, before %016llx)\n",
+                (unsigned long long)((uintptr_t)(g + i) - HEAP_BASE), (unsigned long long)s, (unsigned long long)expect,
+                (unsigned long long)p);
+        }
+    }
+    for (; i < n; i++) {  // (the tail)
+        if (src[i] == pre[i]) continue;
+        if (g[i] == pre[i]) g[i] = src[i]; else kept++;
+    }
+    static uint64_t next_log = 1;
+    if (kept != k0 && kept >= next_log) {  // (1, 2, 4, 8... so far)
+        next_log = kept * 2;
+        LOG("[vk] copy-back: %llu game writes kept so far (the whole-range copy undid them)\n", (unsigned long long)kept);
+    }
+}
 
 static void gcopy_retire(uint64_t done) {
     pthread_mutex_lock(&gc_lock);
@@ -6790,7 +6939,10 @@ static void gcopy_retire(uint64_t done) {
     for (int i = 0; i < gc_nback; i++) {
         if (gc_back[i].seq <= done) {
             if (!gc_back[i].shadow) {
-                memcpy((void *)(uintptr_t)gc_back[i].addr, gc_back[i].src, gc_back[i].len);
+                if (gc_back[i].pre) {
+                    gcopy_back_changed((uint8_t *)(uintptr_t)gc_back[i].addr, gc_back[i].src, gc_back[i].pre, gc_back[i].len);
+                    free(gc_back[i].pre);
+                } else memcpy((void *)(uintptr_t)gc_back[i].addr, gc_back[i].src, gc_back[i].len);
                 continue;
             }
             // (the arena: 256 bytes at a time, what the GPU changed since the last upload - the shadow - and the CPU
@@ -6806,7 +6958,7 @@ static void gcopy_retire(uint64_t done) {
                 // GPU's and wrote them over the CPU's: the game's allocator lists looped, the game hung)
                 if (gc_back[i].bseq[b / 256] > gc_back[i].seq) continue;
                 if (!memcmp(src + b, sh + b, n) || memcmp(g + b, sh + b, n)) continue;  // (GPU unchanged / CPU wrote)
-                memcpy(g + b, src + b, n);
+                ga_back_block(g + b, src + b, sh + b, n);
                 memcpy(sh + b, src + b, n);
             }
         } else gc_back[k++] = gc_back[i];
@@ -7344,6 +7496,7 @@ static VkDescriptorBufferInfo gmiss_info(void) {
 static void gres_reset(void) {
     gres_gen++;
     pthread_mutex_lock(&gc_lock);
+    for (int i = 0; i < gc_nback; i++) free(gc_back[i].pre);
     gc_nback = 0;  // (their shadow / bseq pointers and guest addresses belong to the boot being torn down)
     pthread_mutex_unlock(&gc_lock);
     for (int i = 0; i < ga_nres; i++) { free(ga_res[i].shadow); free(ga_res[i].bseq); }
@@ -7564,8 +7717,14 @@ static void gcopy_prepare_(unsigned stage_mask, bool store) {
         gmap_tab[i * 4 + 0] = (uint32_t)r[i].lo;
         gmap_tab[i * 4 + 1] = (uint32_t)len;
         gmap_tab[i * 4 + 2] = (uint32_t)(off >> 2);
-        if (r[i].store && !gres_init() && gc_nback < 256)
-            gc_back[gc_nback++] = (GcBack){(const uint8_t *)gc_span.ptr + off, HEAP_BASE + r[i].lo, len, seq, NULL, NULL};
+        if (r[i].store && !gres_init() && gc_nback < 256) {
+            // (the range as it is now, kept: gcopy_retire writes back only what the GPU changed from it - #401)
+            static int whole = -1;
+            if (whole < 0) whole = getenv("LARECOMP_GCOPY_WHOLE") && atoi(getenv("LARECOMP_GCOPY_WHOLE"));
+            uint8_t *pre = whole ? NULL : malloc(len);
+            if (pre) memcpy(pre, (const uint8_t *)gc_span.ptr + off, len);
+            gc_back[gc_nback++] = (GcBack){(const uint8_t *)gc_span.ptr + off, HEAP_BASE + r[i].lo, len, seq, NULL, NULL, pre};
+        }
         off += (len + 255) & ~255ull;
     }
     pthread_mutex_unlock(&gc_lock);
@@ -7926,6 +8085,10 @@ static int compute_reset(void);  // (below compute_program)
 // the safety net, not the mechanism.
 void vk_exec_reset(void) {
     jobs_drain();
+    g_sync_shaders = -1;  // (LARECOMP_SYNC_SHADERS / "Wait for shaders": read again for the game that starts next)
+#ifdef __ANDROID__
+    prewarm_reset();
+#endif
 #ifdef __ANDROID__
     vk_vamm_reset();
 #endif
@@ -9233,13 +9396,30 @@ static void draw_(CmdRec *r, bool indexed) {
 #endif
         VkObjectEntry *entry = vk_object_slot(&pipe_cache, ph);
         pp = entry->object;
+#ifdef __ANDROID__
+        if (pp && pp->prewarmed && memcmp(&k, &pp->k, sizeof k) != 0 && !prewarm_resolve_collision(pp, &k)) {
+            stat_skipped++;  // (a prewarmed pipeline of another key under this hash, still building: this draw is skipped)
+            skip_note("pipeline");
+            return;
+        }
+#endif
         if (!pp) {
             pp = calloc(1, sizeof *pp);
             pp->k = k;
             entry->object = pp;
+#ifdef __ANDROID__
+            if (prewarm_enabled()) prewarm_record(&k);
+#endif
             schedule_pipeline_build(pp, keep);
         } else if (pp->evicted) {  // (destroyed by pipe_evict: built again)
             pp->evicted = false;
+            schedule_pipeline_build(pp, keep);
+        } else if (pp->retry_s && g_exec_s >= pp->retry_s && atomic_load(&pp->state) == 2) {  // (out of memory before)
+            static int nlog;
+            if (nlog++ < 20) LOG("[vk] graphics pipeline vs %llx fs %llx: built again (out of memory before)\n",
+                                 (unsigned long long)pp->k.prog->code[0], (unsigned long long)pp->k.prog->code[1]);
+            pp->retry_s = 0;
+            atomic_store(&pp->state, 0);
             schedule_pipeline_build(pp, keep);
         }
         // Verification rebuilds the original key to detect missing invalidations during later device tests.
@@ -9250,6 +9430,9 @@ static void draw_(CmdRec *r, bool indexed) {
         last_pipeline = pp;
         pipeline_dirty = false;
     }
+#ifdef __ANDROID__
+    if (pp->prewarmed) prewarm_first_draw(pp);
+#endif
     if (keep) wait_built_job(&pp->state, NULL, pp, pp->k.prog ? pp->k.prog->code[1] : 0);
     if (atomic_load(&pp->state) != 1) {
         if (g_debug_frame) LOG("[draw]   skipped: pipeline %s\n", atomic_load(&pp->state) ? "failed" : "still building");
@@ -11142,6 +11325,9 @@ void vk_execute_now(uint64_t handle) {
 #else
 void backend_execute(uint64_t handle) {
 #endif
+#ifdef __ANDROID__
+    if (prewarm_enabled()) prewarm_tick();
+#endif
     PROF_T0();
 #ifdef __ANDROID__
     game_pending = true;  // (renderer_fence_seq)
@@ -11162,6 +11348,7 @@ void backend_execute(uint64_t handle) {
     else renderer_submit();
 #ifdef __ANDROID__
     game_pending = false;
+    if (prewarm_enabled()) prewarm_tick();
 #endif
 }
 
