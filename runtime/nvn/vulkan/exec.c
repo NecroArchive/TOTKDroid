@@ -62,8 +62,6 @@ static int prof = -1;
 static uint64_t prof_dsw, prof_cbuf, prof_set_hits, prof_set_miss;  // (sets: driver writes, cbuf copies, set cache)
 static uint64_t prof_gcopy;  // (sets: copy mode's global memory tables - gcopy_prepare / gwin_prepare, counted in sets)
 static uint64_t stat_gc_memo_hits;  // (gcopy_prepare: tables reused from the draw before)
-static uint64_t stat_memo_hits, stat_memo_miss;  // (stage_set: a set as the last draw made it)
-static uint64_t prof_cbp[16], prof_cbn[16];  // (sets: cbuf_info by the way it took, cb_path)
 static uint64_t prof_set_tex, prof_set_def, prof_set_hash;  // (sets: stage_set's texture lookups, deferred bindings, hash + cache)
 static uint64_t prof_exec, prof_draw, prof_sets, prof_vtx, prof_submit, prof_pre, prof_key, prof_dyn, prof_tex, prof_up, prof_gpu;
 static VkQueryPool prof_qp;
@@ -2229,18 +2227,9 @@ const char *renderer_stats(void) {
                  prof_gpu / 1e6, prof_exec / 1e6, prof_draw / 1e6, prof_pre / 1e6, prof_key / 1e6, prof_dyn / 1e6, prof_sets / 1e6,
                  prof_tex / 1e6, prof_up / 1e6, prof_vtx / 1e6, prof_submit / 1e6);
         n = strlen(stats_text);
-        snprintf(stats_text + n, sizeof stats_text - n, " | sets: driver %.0f cbuf %.0f gmem tables %.0f vtex %.0f deferred %.0f hash %.0f ms (%llu reused), cache %llu hits %llu misses, as the last draw %llu of %llu",
+        snprintf(stats_text + n, sizeof stats_text - n, " | sets: driver %.0f cbuf %.0f gmem tables %.0f vtex %.0f deferred %.0f hash %.0f ms (%llu reused), cache %llu hits %llu misses",
                  prof_dsw / 1e6, prof_cbuf / 1e6, prof_gcopy / 1e6, prof_set_tex / 1e6, prof_set_def / 1e6, prof_set_hash / 1e6, (unsigned long long)stat_gc_memo_hits, (unsigned long long)prof_set_hits,
-                 (unsigned long long)prof_set_miss, (unsigned long long)stat_memo_hits, (unsigned long long)(stat_memo_hits + stat_memo_miss));
-        stat_memo_hits = stat_memo_miss = 0;
-        n = strlen(stats_text);
-        snprintf(stats_text + n, sizeof stats_text - n, " | cbuf ways (ms/calls): drv0 %.0f/%llu drv %.0f/%llu const %.0f/%llu none %.0f/%llu up %.0f/%llu direct %.0f/%llu wide %.0f/%llu window %.0f/%llu copy %.0f/%llu",
-                 prof_cbp[0] / 1e6, (unsigned long long)prof_cbn[0], prof_cbp[1] / 1e6, (unsigned long long)prof_cbn[1],
-                 prof_cbp[2] / 1e6, (unsigned long long)prof_cbn[2], prof_cbp[3] / 1e6, (unsigned long long)prof_cbn[3],
-                 prof_cbp[4] / 1e6, (unsigned long long)prof_cbn[4], prof_cbp[5] / 1e6, (unsigned long long)prof_cbn[5],
-                 prof_cbp[6] / 1e6, (unsigned long long)prof_cbn[6], prof_cbp[7] / 1e6, (unsigned long long)prof_cbn[7],
-                 prof_cbp[8] / 1e6, (unsigned long long)prof_cbn[8]);
-        memset(prof_cbp, 0, sizeof prof_cbp), memset(prof_cbn, 0, sizeof prof_cbn);
+                 (unsigned long long)prof_set_miss);
         prof_dsw = prof_cbuf = prof_gcopy = prof_set_hits = prof_set_miss = stat_gc_memo_hits = 0;
         prof_set_tex = prof_set_def = prof_set_hash = 0;
         extern uint64_t prof_tex_checks, prof_tex_samples, prof_tex_full, prof_tex_full_bytes, prof_tex_dyn, prof_tex_same_bytes,
@@ -5448,7 +5437,6 @@ static void panefix_log(const char *why, const float *f) {
         (unsigned long long)g_cur_fs_hash, why, f[19], f[132], f[133], f[44], f[45], framepace_in_menu(), widescreen_in_menu());
 }
 
-static int cb_path;  // (LARECOMP_VK_PROF: which way cbuf_info took - stage_set_build times each)
 static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32_t gx, uint32_t gy, uint32_t gz) {
     static const uint8_t zeros[0x10000];
     if (k == 0) {
@@ -5466,7 +5454,7 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
         // whose cb0 ends before the storage-buffer table see an all-zero block.
         uint32_t base = 0x110 + 0x100 * (stage == 1 ? 4 : 0);
         if (compact && stage != 5 && size <= base)
-            cb_path = 0; return ubo_span(copy_dedupe(stage == 1 ? DEDUPE_DRV_F : DEDUPE_DRV_V, zeros, size, 256), size);
+            return ubo_span(copy_dedupe(stage == 1 ? DEDUPE_DRV_F : DEDUPE_DRV_V, zeros, size, 256), size);
         memset(drv, 0, compact ? size : sizeof drv);
         if (stage == 5) {
             drv[0x200 / 4] = gx; drv[0x204 / 4] = gy; drv[0x208 / 4] = gz;
@@ -5484,18 +5472,18 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
                 e[2] = (uint32_t)st.sbuf[stage][i].size;
             }
         }
-        cb_path = 1; return ubo_span(copy_dedupe(stage == 5 ? DEDUPE_DRV_C : stage == 1 ? DEDUPE_DRV_F : DEDUPE_DRV_V, drv, size, 256), size);
+        return ubo_span(copy_dedupe(stage == 5 ? DEDUPE_DRV_C : stage == 1 ? DEDUPE_DRV_F : DEDUPE_DRV_V, drv, size, 256), size);
     }
     if (k == 1) {  // compiler constants stored after the shader code
         NvnShaderStage *ss = &st.program->stages[stage];
         uint64_t size = ss->const_size ? ss->const_size : 16;
         if (size < si->cbuf_size[1]) size = si->cbuf_size[1];
-        cb_path = 2; return ubo_span(guest_copy(ss->code_addr + ss->const_offset, size, GC_CONST), size);  // (constant: shared per submission)
+        return ubo_span(guest_copy(ss->code_addr + ss->const_offset, size, GC_CONST), size);  // (constant: shared per submission)
     }
     int idx = k - 3;  // cbuf_base
     Range r = (idx >= 0 && idx < 18) ? st.ubuf[stage][idx] : (Range){0, 0};
     uint64_t size = si->cbuf_size[k] ? si->cbuf_size[k] : 256;
-    if (!r.addr) { cb_path = 3; return ubo_span(vk_transient_copy(zeros, size, 256), size); }
+    if (!r.addr) return ubo_span(vk_transient_copy(zeros, size, 256), size);
     if ((si->cbuf_dynamic & (1u << k)) && r.size) size = r.size > 0x10000 ? 0x10000 : r.size;
     if (size > r.size && r.size) size = r.size;
     if (size < 16) size = 16;
@@ -5588,12 +5576,12 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
     }
     if (up_fix.sx > 0 && (stage == 0 || stage == 1)) {  // (a scaled scene's half-size upsample: up_fix - before the
         VkDescriptorBufferInfo d;                       //  in-place reads, which would bind the game's own values)
-        if (stage == 0 ? up_patch(r.addr, size, &d) : up_patch_frag(r.addr, size, &d)) { cb_path = 4; return d; }
+        if (stage == 0 ? up_patch(r.addr, size, &d) : up_patch_frag(r.addr, size, &d)) return d;
     }
 #ifdef __ANDROID__
     {
         VkDescriptorBufferInfo d;
-        if (ubo_direct(r.addr, size, &d)) { cb_path = 5; return d; }
+        if (ubo_direct(r.addr, size, &d)) return d;
     }
 #endif
     // snapshot: later CPU writes must not leak in. Shared by the draws of one submission binding the same range:
@@ -5695,7 +5683,7 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
                 } else if (map)
                     m[3] = f[3];  // (text: its origin where the spread layout puts it)
                 m[23] += dy;
-                cb_path = 6; return ubo_span(c, size);
+                return ubo_span(c, size);
             }
         }
         if (widescreen_ui_centred() && t0 && vk_texture_scale_group(t0) == RS_OUT && f[12] == 0 && f[13] == 0 && f[14] == -1.0f &&
@@ -5712,7 +5700,7 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
                 // that part: an edge each side, 2026-10-28)
                 VkSpan c = vk_transient_copy(f, size, 256);  // (the pane's x row, about the layout's middle)
                 for (int i = 16; i < 20; i++) ((float *)c.ptr)[i] *= g;
-                cb_path = 6; return ubo_span(c, size);
+                return ubo_span(c, size);
             } else if (size >= 0x230 && f[15] == 0 && f[0] > 0 && fabsf(f[5] / f[0] - 16.0f / 9.0f * g) < 0.01f &&
                        full_width_pane(f)) {
                 panefix_log("full-width", f);
@@ -5721,7 +5709,7 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
                 // the sides, 2026-10-28), at any scale (the Game Over fade animates it)
                 VkSpan c = vk_transient_copy(f, size, 256);
                 for (int i = 16; i < 20; i++) ((float *)c.ptr)[i] *= g;
-                cb_path = 6; return ubo_span(c, size);
+                return ubo_span(c, size);
             } else if (size >= 0x230 && f[15] == 0 && f[0] > 0 && g > 1.001f && fabsf(f[5] / f[0] - 16.0f / 9.0f) < 0.01f) {
                 // A layout drawn through a camera of its own left at 16:9 - the inventory's cursor, the loading
                 // screens - would stretch across the wide image (the cursor g times farther from the middle than the
@@ -5735,28 +5723,28 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
                 for (int i = 0; i < 4; i++) m[i] /= g;
                 if (full_width_pane(f))
                     for (int i = 16; i < 20; i++) m[i] *= g;
-                cb_path = 6; return ubo_span(c, size);
+                return ubo_span(c, size);
             } else if (size >= 0x230 && f[15] == 0 && f[0] > 0 && fabsf(f[5] / f[0] - 16.0f / 9.0f * g) < 0.01f) {
                 float d = widescreen_hud_shift(f[19]);
                 if (d != 0) {
                     panefix_log("hud-shift", f);
                     VkSpan c = vk_transient_copy(f, size, 256);
                     ((float *)c.ptr)[19] += d;
-                    cb_path = 6; return ubo_span(c, size);
+                    return ubo_span(c, size);
                 }
             } else if (f[15] > 1.0f && g > 1.001f && f[0] > 0 && fabsf(f[5] / f[0] - 16.0f / 9.0f) < 0.01f) {
                 // Text through a layout camera left at 16:9 (a loading screen's tip): its x row narrowed like the
                 // panes' projection above, or it sat apart from its box (2026-10-28)
                 VkSpan c = vk_transient_copy(f, size, 256);
                 for (int i = 0; i < 4; i++) ((float *)c.ptr)[i] /= g;
-                cb_path = 6; return ubo_span(c, size);
+                return ubo_span(c, size);
             } else if (f[15] > 1.0f) {
                 float d = widescreen_hud_shift(f[3] / f[15] * g * 640.0f);  // (layout x of the origin: 640 g units a side)
                 if (d != 0) {
                     VkSpan c = vk_transient_copy(f, size, 256);
                     float *m = (float *)c.ptr, k = d / (640.0f * g);  // (that many NDC units)
                     for (int i = 0; i < 4; i++) m[i] += k * m[12 + i];
-                    cb_path = 6; return ubo_span(c, size);
+                    return ubo_span(c, size);
                 }
             }
         }
@@ -5764,7 +5752,7 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
 #ifdef __ANDROID__
     if (si->cbwin_mask >> k & 1u) {
         VkDescriptorBufferInfo d;
-        if (cbwin_bind(stage, k, r.addr, size, &d)) { cb_path = 7; return d; }
+        if (cbwin_bind(stage, k, r.addr, size, &d)) return d;
     }
     static int log_cbwin = -1;
     if (log_cbwin < 0) log_cbwin = getenv("LARECOMP_LOG_CBWIN") != NULL;
@@ -5781,7 +5769,7 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
     stat_cb_n[dk]++, stat_cb_bytes[dk] += size;
     if (dk && ct_on()) LOG("[ct] dyncbuf stage %d k %d addr %llx size %llx (bound %llx) fs %016llx\n", stage, k, (unsigned long long)r.addr,
                            (unsigned long long)size, (unsigned long long)r.size, (unsigned long long)g_cur_fs_hash);
-    cb_path = 8; return ubo_span(guest_copy(r.addr, size, GC_UBO), size);
+    return ubo_span(guest_copy(r.addr, size, GC_UBO), size);
 }
 
 // Global memory (shader LDG/STG, maxwell_gmem_base = HEAP_BASE): the guest heap imported as a GPU buffer
@@ -8088,84 +8076,7 @@ static float g_mirror_w;  // mirror mode's composite: its render target width (r
 static bool is_ubo(VkDescriptorType t) { return t == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || t == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC; }
 
 // dyn / ndyn: the set's dynamic uniform buffer offsets, in binding order (its bindings of that type: compile_program)
-static VkDescriptorSet stage_set_build(Prog *p, VkDescriptorSetLayout layout, uint32_t set, int stage, ShaderInfo *si,
-                                       const float *rscale_row0, const float tint[8], uint32_t gx, uint32_t gy, uint32_t gz,
-                                       const VkDescriptorImageInfo *pre_ii, uint32_t *dyn, uint32_t *ndyn);
-
-// A draw stage's set as the last draw of that stage made it, when it asks for it with the same inputs: the program and
-// layout, the submission (guest_copy serves one copy per address and submission), the bound constant and storage
-// buffer ranges, the textures (fragment: their descriptors and scales), the scale row and the tint. Building it again
-// - a constant buffer descriptor each, hashes, the set cache - was ~40% of a draw's time in the woods of the surface
-// (~3,700 draws a frame on the POCO F7 Ultra), and ~80% of those builds found a set already written. Not where a set's
-// contents depend on the bytes at those addresses: the final image's layouts (widescreen), the scaled scene's upsample
-// (up_fix), the rows cbwin_bind copies, the vertex stage's textures (texture_info's checks), debug frames.
-// LARECOMP_SET_MEMO=0: off; LARECOMP_AB=<n>:setmemo.
-typedef struct {
-    VkDescriptorSetLayout layout;
-    const ShaderInfo *si;
-    uint64_t seq, code, const_off;
-    Range ubuf[18], sbuf[16];
-    float r0[4], tint[8], mw;
-    int ntex;
-    float sc[64][2];
-    VkDescriptorImageInfo ii[64];  // (last: compared up to ntex)
-} SetMemoKey;
-static struct { bool valid; SetMemoKey k; VkDescriptorSet ds; uint32_t ndyn, dyn[MAX_BIND]; } set_memo[2];
-static uint64_t stat_memo_hits, stat_memo_miss;
-static bool set_memo_on(void) {
-    static int on = -1;
-    if (on < 0) on = !getenv("LARECOMP_SET_MEMO") || atoi(getenv("LARECOMP_SET_MEMO")) != 0;
-    return on && AB("setmemo") != 0;
-}
-
 static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t set, int stage, ShaderInfo *si, const float *rscale_row0,
-                                 const float tint[8], uint32_t gx, uint32_t gy, uint32_t gz, const VkDescriptorImageInfo *pre_ii,
-                                 uint32_t *dyn, uint32_t *ndyn) {
-#ifdef __ANDROID__
-    int sg = stage == 1 ? 1 : 0;
-    NvnTexture *t0 = st.rt.ncolor ? st.rt.color[0] : NULL;
-    bool memo = (stage == 0 || stage == 1) && set_memo_on() && !g_debug_frame && up_fix.sx <= 0 && dyn && ndyn &&
-                (stage == 0 ? si->ntex == 0 : pre_ii != NULL) && !(t0 && vk_texture_scale_group(t0) == RS_OUT);
-    static SetMemoKey key;
-    size_t klen = 0;
-    if (memo) {
-        int nt = si->ntex < 64 ? si->ntex : 64;
-        memset(&key, 0, offsetof(SetMemoKey, ii));
-        key.layout = layout, key.si = si, key.seq = vk_pending_seq() + (gcopy_gen << 40);
-        if (st.program) key.code = st.program->stages[stage].code_addr, key.const_off = st.program->stages[stage].const_offset;
-        memcpy(key.ubuf, st.ubuf[stage], sizeof key.ubuf);
-        memcpy(key.sbuf, st.sbuf[stage], sizeof key.sbuf);
-        if (rscale_row0) memcpy(key.r0, rscale_row0, sizeof key.r0);
-        if (tint) memcpy(key.tint, tint, sizeof key.tint);
-        key.mw = g_mirror_w, key.ntex = nt;
-        if (stage == 1) {
-            memcpy(key.sc, tex_sc[1], (size_t)nt * sizeof key.sc[0]);
-            memcpy(key.ii, pre_ii, (size_t)nt * sizeof key.ii[0]);
-        }
-        klen = offsetof(SetMemoKey, ii) + (size_t)nt * sizeof key.ii[0];
-        if (set_memo[sg].valid && !memcmp(&set_memo[sg].k, &key, klen)) {
-            stat_memo_hits++;
-            *ndyn = set_memo[sg].ndyn;
-            memcpy(dyn, set_memo[sg].dyn, set_memo[sg].ndyn * sizeof *dyn);
-            return set_memo[sg].ds;
-        }
-        stat_memo_miss++;
-    }
-    VkDescriptorSet ds = stage_set_build(p, layout, set, stage, si, rscale_row0, tint, gx, gy, gz, pre_ii, dyn, ndyn);
-    if (stage == 0 || stage == 1) set_memo[sg].valid = false;
-    if (memo && !cbw_patch[sg].m[0] && *ndyn <= MAX_BIND) {
-        set_memo[sg].valid = true;
-        memcpy(&set_memo[sg].k, &key, klen);
-        set_memo[sg].ds = ds, set_memo[sg].ndyn = *ndyn;
-        memcpy(set_memo[sg].dyn, dyn, *ndyn * sizeof *dyn);
-    }
-    return ds;
-#else
-    return stage_set_build(p, layout, set, stage, si, rscale_row0, tint, gx, gy, gz, pre_ii, dyn, ndyn);
-#endif
-}
-
-static VkDescriptorSet stage_set_build(Prog *p, VkDescriptorSetLayout layout, uint32_t set, int stage, ShaderInfo *si, const float *rscale_row0,
                                  const float tint[8], uint32_t gx, uint32_t gy, uint32_t gz, const VkDescriptorImageInfo *pre_ii,
                                  uint32_t *dyn, uint32_t *ndyn) {
 #ifdef __ANDROID__
@@ -8218,7 +8129,7 @@ static VkDescriptorSet stage_set_build(Prog *p, VkDescriptorSetLayout layout, ui
         } else if (is_ubo(b->type) && b->binding < 17) {
             uint64_t tc_ = prof > 0 ? plat_now_ns() : 0;
             bi[n] = cbuf_info(stage, si, (int)b->binding, gx, gy, gz);
-            if (prof > 0) { uint64_t d_ = plat_now_ns() - tc_; prof_cbuf += d_; prof_cbp[cb_path & 15] += d_; prof_cbn[cb_path & 15]++; }
+            if (prof > 0) prof_cbuf += plat_now_ns() - tc_;
             w[n].pBufferInfo = &bi[n];
         } else if (b->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
 #ifdef __ANDROID__
