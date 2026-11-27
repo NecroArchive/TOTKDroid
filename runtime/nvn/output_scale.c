@@ -119,7 +119,13 @@ void output_scale(double dw, double dh, bool reshape_allowed, double now, double
     double hs;
     int mode = g_settings.res_mode;
     if (forced > 0) hs = forced;
-    else if (mode >= 1 && mode <= 8) hs = mode;
+    else if (mode == 1) {
+        // 1x, at most the final image's lines: with Output resolution under 900 lines the 900-line scene was drawn
+        // only to be scaled down to it. 720p on a POCO F7 Pro (Adreno 750, 30 fps): scene 2000x900 -> 1600x717,
+        // 5.16 -> 4.65 W, the picture a little softer in the foliage (2x and up stay as asked: supersampling)
+        hs = fmin(1.0, h * 1080.0 / SCENE_LINES);
+    }
+    else if (mode >= 2 && mode <= 8) hs = mode;
     else {
         hs = h * 1080.0 / SCENE_LINES;  // Match display
         // (Auto output: the shares below are of the screen's lines, as they were before it - only the final image is
