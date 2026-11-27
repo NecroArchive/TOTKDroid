@@ -1825,7 +1825,7 @@ static void prelaunch_tab(float sc) {
         ImGui::TextDisabled("%s", tr("On: the game's memory is mapped straight into the GPU's, the fastest way. Off: what each "
                                   "frame uses is copied instead - it draws right where the fast way doesn't, but this game "
                                   "runs at about half the frame rate (15 fps instead of 35 on an Adreno 830). Automatic: on "
-                                  "for Adreno 8xx GPUs, off for the others. On holds over 2 GB of the GPU's memory at once: with 8 "
+                                  "for Adreno 7xx and 8xx GPUs, off for the others. On holds over 2 GB of the GPU's memory at once: with 8 "
                                   "GB of RAM or less the GPU may run out of it and close the game - then use Off. Applies "
                                   "when the game starts."));
         ImGui::Spacing();
